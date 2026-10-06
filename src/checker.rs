@@ -100,8 +100,8 @@ impl Default for Config {
         let mut t = FxHashMap::default();
         t.insert(EditKind::Delete, 3.0);
         t.insert(EditKind::Substitute, 3.0);
-        t.insert(EditKind::Inflection, 3.0);
-        t.insert(EditKind::Insert, 3.0);
+        t.insert(EditKind::Inflection, 2.0);
+        t.insert(EditKind::Insert, 1.5);
         t.insert(EditKind::Homophone, 3.0);
         // 文字単位の編集は遅く誤検出も多いので既定では無効 (README 参照)
         t.insert(EditKind::Char, f32::INFINITY);

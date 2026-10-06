@@ -91,7 +91,7 @@ struct ModelArgs {
     #[arg(long, default_value = "data/readings.tsv")]
     readings: PathBuf,
     /// 閾値 (log10): delete,substitute,inflection,insert,homophone,char (inf で無効)
-    #[arg(long, default_value = "3,3,3,3,3,inf")]
+    #[arg(long, default_value = "3,3,2,1.5,3,inf")]
     thresholds: String,
     /// 助詞の脱落 (挿入候補) を無効にする
     #[arg(long)]
