@@ -22,6 +22,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// MeCab 形式の生辞書 (UTF-8 の lex.csv / matrix.def / char.def / unk.def) をバイナリ辞書へ変換する。
+    BuildDict {
+        raw_dir: PathBuf,
+        #[arg(short, long, default_value = "data/ipadic.dic")]
+        output: PathBuf,
+    },
     /// 1 行 1 文のコーパス (stdin) を分かち書きして stdout へ。活用表も集める。
     Tokenize {
         #[arg(long)]
@@ -96,6 +102,32 @@ struct ModelArgs {
     /// 文書内でこの回数以上繰り返される並びは指摘しない (0 で無効)
     #[arg(long, default_value_t = 2)]
     doc_repeat: usize,
+    /// 2 段目のマスク言語モデル (HuggingFace 形式のディレクトリ)。"none" で無効
+    #[arg(long, default_value = "data/mlm")]
+    mlm: String,
+    /// 最終スコア = n-gram Δ + mlm_weight × MLM Δ
+    #[arg(long, default_value_t = 1.0)]
+    mlm_weight: f32,
+    /// MLM 併用時に 1 段目の閾値を緩める幅
+    #[arg(long, default_value_t = 1.5)]
+    stage1_slack: f32,
+    /// MLM の長さ補正 (サブワード 1 つあたりの nats)
+    #[arg(long, default_value_t = 2.0)]
+    length_penalty: f32,
+    /// n-gram の最良スコアが閾値+band 以上で 2 位との差が gap 以上なら MLM を使わない
+    #[arg(long, default_value_t = 2.0)]
+    mlm_band: f32,
+    #[arg(long, default_value_t = 1.0)]
+    mlm_gap: f32,
+    /// MLM を PLL (1 サブワードずつマスク) で使う。高精度だが遅い
+    #[arg(long)]
+    pll: bool,
+    /// MLM を採否の判定にも使う (既定は修正案選びだけ)。遅くなる
+    #[arg(long)]
+    mlm_accept: bool,
+    /// MLM で採点する範囲 (編集箇所の前後の文字数)
+    #[arg(long, default_value_t = 1)]
+    mlm_margin: usize,
 }
 
 impl ModelArgs {
@@ -116,6 +148,14 @@ impl ModelArgs {
         } else {
             self.doc_repeat
         };
+        cfg.mlm_weight = self.mlm_weight;
+        cfg.stage1_slack = self.stage1_slack;
+        cfg.mlm_length_penalty = self.length_penalty;
+        cfg.mlm_band = self.mlm_band;
+        cfg.mlm_gap = self.mlm_gap;
+        cfg.mlm_pll = self.pll;
+        cfg.mlm_choice_only = !self.mlm_accept;
+        cfg.mlm_margin = self.mlm_margin;
         cfg
     }
 
@@ -134,13 +174,13 @@ impl ModelArgs {
             lm.order,
             lm.vocab_len()
         );
-        Ok(Checker::new(
-            Tokenizer::new()?,
-            lm,
-            self.config(),
-            infl,
-            readings,
-        ))
+        let checker = Checker::new(Tokenizer::new()?, lm, self.config(), infl, readings);
+        let mlm_dir = PathBuf::from(&self.mlm);
+        if self.mlm != "none" && mlm_dir.join("model.safetensors").exists() {
+            eprintln!("mlm: {mlm_dir:?}");
+            return Ok(checker.with_mlm(celso::mlm::Mlm::load(&mlm_dir)?));
+        }
+        Ok(checker)
     }
 }
 
@@ -156,6 +196,11 @@ const ALL_KINDS: [EditKind; 6] = [
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::BuildDict { raw_dir, output } => {
+            celso::tokenize::build_dict(&raw_dir, &output)?;
+            eprintln!("wrote {output:?}");
+            Ok(())
+        }
         Cmd::Tokenize {
             inflections,
             readings,
@@ -199,15 +244,27 @@ fn main() -> Result<()> {
             let el = t.elapsed();
             if !quiet {
                 for f in &findings {
+                    let alts: Vec<String> = f
+                        .alternatives
+                        .iter()
+                        .map(|a| {
+                            format!("「{}」→「{}」({:.2})", a.original, a.replacement, a.score)
+                        })
+                        .collect();
                     println!(
-                        "{}..{}\t{}\t「{}」→「{}」\tΔ={:.2}\t{}",
+                        "{}..{}\t{}\t「{}」→「{}」\tΔ={:.2}\t{}{}",
                         f.start,
                         f.end,
                         f.kind.label(),
                         f.original,
                         f.replacement,
                         f.delta,
-                        context(&text, f)
+                        context(&text, f),
+                        if alts.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t別案: {}", alts.join(" "))
+                        }
                     );
                 }
             }
@@ -259,7 +316,7 @@ fn tokenize_cmd(inflections: Option<PathBuf>, readings: Option<PathBuf>) -> Resu
         let res: Vec<(String, Vec<(String, String, String)>, Vec<(String, String)>)> = chunk
             .par_iter()
             .map_init(
-                || tok.clone(),
+                || tok,
                 |tok, line| {
                     let toks = tok.tokenize(&norm(line));
                     let mut inf = Vec::new();
@@ -271,13 +328,12 @@ fn tokenize_cmd(inflections: Option<PathBuf>, readings: Option<PathBuf>) -> Resu
                         }
                         s.push_str(t.key());
                         if matches!(t.pos.as_str(), "動詞" | "形容詞" | "助動詞")
-                            && t.conj_type != "*"
+                            && !t.conj_type.is_empty()
                         {
                             inf.push((t.base.clone(), t.conj_type.clone(), t.surface.clone()));
                         }
                         if matches!(t.pos.as_str(), "名詞" | "動詞" | "形容詞" | "副詞")
                             && !t.reading.is_empty()
-                            && t.reading != "*"
                             && t.surface.chars().any(is_kanji)
                         {
                             rd.push((t.reading.clone(), t.surface.clone()));
@@ -368,13 +424,14 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
     let doc_norm = norm(&text);
     let doc_chars: Vec<char> = doc_norm.chars().collect();
     let limit = checker.cfg.doc_repeat_limit;
+    let texts: Vec<&str> = examples.iter().map(|e| e.text.as_str()).collect();
+    let raw = checker.check_many(&texts);
     let results: Vec<Vec<Finding>> = examples
-        .par_iter()
-        .map(|e| {
+        .iter()
+        .zip(raw)
+        .map(|(e, fs)| {
             let chars: Vec<char> = e.text.chars().collect();
-            checker
-                .check(&e.text)
-                .into_iter()
+            fs.into_iter()
                 .filter(|f| {
                     let a = f.start.saturating_sub(2);
                     let b = (f.end + 2).min(chars.len());
@@ -573,10 +630,11 @@ fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize) -> Result<()> {
         }
     }
     let t = Instant::now();
-    let res: Vec<(Vec<Finding>, Vec<Finding>)> = recs
-        .par_iter()
-        .map(|r| (checker.check(&r.pre), checker.check(&r.post)))
-        .collect();
+    let mut texts: Vec<&str> = recs.iter().map(|r| r.pre.as_str()).collect();
+    texts.extend(recs.iter().map(|r| r.post.as_str()));
+    let mut all = checker.check_many(&texts);
+    let posts = all.split_off(recs.len());
+    let res: Vec<(Vec<Finding>, Vec<Finding>)> = all.into_iter().zip(posts).collect();
     eprintln!("checked {} pairs in {:.2?}", recs.len(), t.elapsed());
     let mut cats: std::collections::BTreeMap<String, [usize; 4]> = Default::default();
     let mut shown = 0;

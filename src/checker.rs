@@ -8,6 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::lm::{BOS, EOS, Model, UNK};
+use crate::mlm::{Mlm, Query};
 use crate::norm::norm;
 use crate::tokenize::{Token, Tokenizer};
 
@@ -48,8 +49,21 @@ pub struct Finding {
     pub original: String,
     pub replacement: String,
     pub kind: EditKind,
-    /// 改善幅 (log10)。
+    /// 最終スコア (log10 換算の改善幅。MLM 併用時は n-gram と MLM の加重和)。
     pub delta: f32,
+    /// 同じ箇所の別の修正案 (スコア順、最良案を含まない)。
+    pub alternatives: Vec<Suggestion>,
+}
+
+/// 別の修正案。範囲は最良案と違うことがある (「まで」を消す案と「まで」→「に」の案など)。
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub start: usize,
+    pub end: usize,
+    pub original: String,
+    pub replacement: String,
+    pub kind: EditKind,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -61,15 +75,33 @@ pub struct Config {
     pub novelty_order: usize,
     /// 指摘箇所の前後を含む文字列が文書内にこの回数以上あれば指摘しない (0 で無効)。
     pub doc_repeat_limit: usize,
+    /// MLM の重み (最終スコア = n-gram Δ + mlm_weight × MLM Δ)。
+    pub mlm_weight: f32,
+    /// MLM 併用時、1 段目は閾値からこの幅だけ下の候補まで残して 2 段目に回す。
+    pub stage1_slack: f32,
+    /// 1 箇所あたり 2 段目に回す候補数。
+    pub top_k: usize,
+    /// MLM で採点する範囲 (編集箇所の前後この文字数に掛かるサブワード)。
+    pub mlm_margin: usize,
+    /// MLM の長さ補正 (サブワード 1 つあたりの nats)。
+    pub mlm_length_penalty: f32,
+    /// n-gram の最良スコアが「閾値 + これ」以上で、かつ 2 位との差が mlm_gap 以上なら MLM を使わずに確定する
+    /// (速度のため。MLM は判断が割れる箇所だけに使う)。
+    pub mlm_band: f32,
+    pub mlm_gap: f32,
+    /// true なら PLL (高精度・低速)、false なら穴埋め採点 (既定・高速)。
+    pub mlm_pll: bool,
+    /// true なら MLM は「確定した箇所の修正案選び」だけに使う (既定)。false なら採否にも使う。
+    pub mlm_choice_only: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut t = FxHashMap::default();
-        t.insert(EditKind::Delete, 2.5);
-        t.insert(EditKind::Substitute, 2.0);
-        t.insert(EditKind::Inflection, 2.0);
-        t.insert(EditKind::Insert, 2.5);
+        t.insert(EditKind::Delete, 3.0);
+        t.insert(EditKind::Substitute, 3.0);
+        t.insert(EditKind::Inflection, 3.0);
+        t.insert(EditKind::Insert, 3.0);
         t.insert(EditKind::Homophone, 3.0);
         // 文字単位の編集は遅く誤検出も多いので既定では無効 (README 参照)
         t.insert(EditKind::Char, f32::INFINITY);
@@ -78,6 +110,15 @@ impl Default for Config {
             enable_insert: true,
             novelty_order: 3,
             doc_repeat_limit: 2,
+            mlm_weight: 1.0,
+            stage1_slack: 1.5,
+            top_k: 4,
+            mlm_margin: 1,
+            mlm_length_penalty: 2.0,
+            mlm_band: 2.0,
+            mlm_gap: 1.0,
+            mlm_pll: false,
+            mlm_choice_only: true,
         }
     }
 }
@@ -112,6 +153,8 @@ pub struct Checker {
     inflections: FxHashMap<(String, String), Vec<String>>,
     /// 読み → (表層形, 出現数) 出現数の多い順
     readings: FxHashMap<String, Vec<(String, u32)>>,
+    /// 2 段目のマスク言語モデル (無ければ n-gram だけで判定)
+    mlm: Option<Mlm>,
 }
 
 struct Cand {
@@ -135,73 +178,382 @@ impl Checker {
             cfg,
             inflections,
             readings,
+            mlm: None,
         }
     }
 
-    /// テキスト全体を検査する。文 (句点・改行) ごとに独立に処理する。
+    pub fn with_mlm(mut self, mlm: Mlm) -> Self {
+        self.mlm = Some(mlm);
+        self
+    }
+
+    /// テキストを検査する。文 (句点・改行・空白) ごとに独立に処理する。
     pub fn check(&self, text: &str) -> Vec<Finding> {
-        let normalized = norm(text);
-        let chars: Vec<char> = normalized.chars().collect();
-        let mut out = Vec::new();
-        let mut s = 0;
-        for i in 0..=chars.len() {
-            // 空白も区切りにする: 条例の「第41条　固定資産税は」のようにラベルと本文を空白で分ける書き方が多く、
-            // ひと続きの文として採点すると「第41条」直後の語が不自然に見えてしまう。
-            let end_here = i == chars.len()
-                || chars[i] == '\n'
-                || chars[i] == '。'
-                || chars[i].is_whitespace();
-            if !end_here {
-                continue;
-            }
-            let e = if i < chars.len() && chars[i] == '。' {
-                i + 1
-            } else {
-                i
-            };
-            if e > s {
-                let sent: String = chars[s..e].iter().collect();
-                for mut f in self.check_sentence(&sent) {
-                    f.start += s;
-                    f.end += s;
-                    out.push(f);
-                }
-            }
-            s = i + 1;
-        }
-        // original は元テキスト (正規化前) から切り出し直す
-        let orig_chars: Vec<char> = text.chars().collect();
-        for f in &mut out {
-            f.original = orig_chars[f.start..f.end].iter().collect();
-        }
-        out
+        self.check_many(&[text]).pop().unwrap_or_default()
     }
 
-    /// 文書全体を検査する。行単位で並列に処理し、最後に文書内の繰り返しで誤検出を抑える。
+    /// 文書全体を検査し、最後に文書内の繰り返しで誤検出を抑える。
     pub fn check_document(&self, text: &str) -> Vec<Finding> {
-        use rayon::prelude::*;
-        let mut lines = Vec::new();
-        let mut off = 0;
-        for l in text.split('\n') {
-            lines.push((off, l));
-            off += l.chars().count() + 1;
-        }
-        let found: Vec<Finding> = lines
-            .par_iter()
-            .flat_map_iter(|(off, l)| {
-                self.check(l).into_iter().map(move |mut f| {
-                    f.start += off;
-                    f.end += off;
-                    f
-                })
-            })
-            .collect();
+        let found = self.check(text);
         let normalized = norm(text);
         let chars: Vec<char> = normalized.chars().collect();
         found
             .into_iter()
             .filter(|f| self.doc_repeats(&normalized, &chars, f, 0) < self.cfg.doc_repeat_limit)
             .collect()
+    }
+
+    /// 複数のテキストをまとめて検査する。MLM の採点要求を全テキスト分まとめて大きなバッチで流すので、
+    /// 1 つずつ `check` するより速い (評価用)。
+    pub fn check_many(&self, texts: &[&str]) -> Vec<Vec<Finding>> {
+        use rayon::prelude::*;
+        // (テキスト番号, 文の開始オフセット, 正規化済みの文)
+        let mut sents: Vec<(usize, usize, String)> = Vec::new();
+        for (ti, text) in texts.iter().enumerate() {
+            let chars: Vec<char> = norm(text).chars().collect();
+            let mut s = 0;
+            for i in 0..=chars.len() {
+                // 空白も区切りにする: 条例の「第41条　固定資産税は」のようにラベルと本文を空白で分ける書き方が多く、
+                // ひと続きの文として採点すると「第41条」直後の語が不自然に見えてしまう。
+                let end_here = i == chars.len()
+                    || chars[i] == '\n'
+                    || chars[i] == '。'
+                    || chars[i].is_whitespace();
+                if !end_here {
+                    continue;
+                }
+                let e = if i < chars.len() && chars[i] == '。' {
+                    i + 1
+                } else {
+                    i
+                };
+                if e > s {
+                    sents.push((ti, s, chars[s..e].iter().collect()));
+                }
+                s = i + 1;
+            }
+        }
+        // 1 段目 (n-gram) は文ごとに並列
+        let mut works: Vec<Vec<Vec<Finding>>> =
+            sents.par_iter().map(|(_, _, t)| self.stage1(t)).collect();
+        // 2 段目 (MLM) は全文まとめて
+        if let Some(mlm) = &self.mlm {
+            let texts: Vec<&str> = sents.iter().map(|(_, _, t)| t.as_str()).collect();
+            self.mlm_rescore_all(mlm, &texts, &mut works);
+        }
+        let mut out: Vec<Vec<Finding>> = vec![Vec::new(); texts.len()];
+        for ((ti, off, _), sites) in sents.iter().zip(works) {
+            for mut f in self.finalize(sites) {
+                f.start += off;
+                f.end += off;
+                for a in &mut f.alternatives {
+                    a.start += off;
+                    a.end += off;
+                }
+                out[*ti].push(f);
+            }
+        }
+        // original は元テキスト (正規化前) から切り出し直す
+        for (ti, fs) in out.iter_mut().enumerate() {
+            let orig: Vec<char> = texts[ti].chars().collect();
+            for f in fs.iter_mut() {
+                f.original = orig[f.start..f.end].iter().collect();
+                for a in &mut f.alternatives {
+                    a.original = orig[a.start..a.end].iter().collect();
+                }
+            }
+        }
+        out
+    }
+
+    /// 正規化済みの 1 文を検査する。
+    pub fn check_sentence(&self, sent: &str) -> Vec<Finding> {
+        self.check_many(&[sent]).pop().unwrap_or_default()
+    }
+
+    /// 1 段目: n-gram で候補を採点し、閾値 (MLM 併用時は少し緩めた値) を超えたものを残す。
+    /// 重なる・隣接する候補を「箇所」にまとめ、箇所ごとに上位 top_k 件を返す (delta は n-gram の Δ)。
+    fn stage1(&self, sent: &str) -> Vec<Vec<Finding>> {
+        let toks = self.tok.tokenize(sent);
+        if toks.is_empty() {
+            return Vec::new();
+        }
+        let ids = self.ids_of(&toks);
+        let slack = if self.mlm.is_some() {
+            self.cfg.stage1_slack
+        } else {
+            0.0
+        };
+
+        let mut cands: Vec<Finding> = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(32);
+        for c in self.candidates(&toks) {
+            let repl_ids: Vec<u32> = c.repl.iter().map(|w| self.lm.word_id(w)).collect();
+            if repl_ids.contains(&UNK) {
+                continue;
+            }
+            let th = self.threshold(c.kind) - slack;
+            if !th.is_finite() || !self.is_novel(&ids, c.a + 1, c.b + 1) {
+                continue;
+            }
+            let delta = self.delta(&ids, c.a + 1, c.b + 1, &repl_ids, &mut buf);
+            if delta >= th {
+                let start = toks
+                    .get(c.a)
+                    .map(|t| t.start)
+                    .unwrap_or_else(|| toks.last().unwrap().end);
+                let end = if c.b > c.a { toks[c.b - 1].end } else { start };
+                cands.push(Finding {
+                    start,
+                    end,
+                    original: toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect(),
+                    replacement: c.repl.concat(),
+                    kind: c.kind,
+                    delta,
+                    alternatives: Vec::new(),
+                });
+            }
+        }
+        if self.threshold(EditKind::Char).is_finite() {
+            cands.extend(self.char_edits(sent, &toks, &ids));
+        }
+        // 箇所にまとめる: 1 文字以内で隣り合う候補は同じ誤りの別解とみなす
+        // (「飲食は店」の「は」を消す案と「店」を消す案など)
+        cands.sort_by_key(|f| (f.start, f.end));
+        let mut sites: Vec<Vec<Finding>> = Vec::new();
+        let mut site_end = 0usize;
+        for f in cands {
+            let (a, b) = (f.start, f.end.max(f.start + 1));
+            match sites.last_mut() {
+                Some(site) if a <= site_end + 1 => {
+                    site_end = site_end.max(b);
+                    site.push(f);
+                }
+                _ => {
+                    site_end = b;
+                    sites.push(vec![f]);
+                }
+            }
+        }
+        for site in &mut sites {
+            site.sort_by(|x, y| y.delta.total_cmp(&x.delta));
+            site.truncate(self.cfg.top_k);
+        }
+        sites
+    }
+
+    /// 箇所ごとに最良案のスコアが閾値を超えたら指摘し、残りは別案として添える。
+    fn finalize(&self, sites: Vec<Vec<Finding>>) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for mut site in sites {
+            site.sort_by(|x, y| y.delta.total_cmp(&x.delta));
+            let best = &site[0];
+            if best.delta < self.threshold(best.kind) {
+                continue;
+            }
+            let mut f = site[0].clone();
+            f.alternatives = site[1..]
+                .iter()
+                .filter(|a| a.delta >= self.threshold(a.kind) - 1.0)
+                .take(2)
+                .map(|a| Suggestion {
+                    start: a.start,
+                    end: a.end,
+                    original: a.original.clone(),
+                    replacement: a.replacement.clone(),
+                    kind: a.kind,
+                    score: a.delta,
+                })
+                .collect();
+            out.push(f);
+        }
+        out
+    }
+
+    /// 2 段目: MLM で採点し直す。delta を「n-gram Δ + 重み × MLM Δ」に書き換える。
+    /// 1 文に 2 箇所以上が採用されそうなら、ほかの箇所を直した文脈でもう一度採点する
+    /// (「西口側までは宿泊から施設…」の「まで」を、「から」を直した文で判断するため)。
+    fn mlm_rescore_all(&self, mlm: &Mlm, sents: &[&str], works: &mut [Vec<Vec<Finding>>]) {
+        let ng: Vec<Vec<Vec<f32>>> = works
+            .iter()
+            .map(|sites| {
+                sites
+                    .iter()
+                    .map(|s| s.iter().map(|f| f.delta).collect())
+                    .collect()
+            })
+            .collect();
+        // MLM に回す箇所: 採否が閾値すれすれか、1 位と 2 位の案が拮抗しているもの
+        let need: Vec<Vec<bool>> = works
+            .iter()
+            .zip(&ng)
+            .map(|(sites, ng)| {
+                sites
+                    .iter()
+                    .zip(ng)
+                    .map(|(site, sc)| {
+                        let best = sc[0];
+                        let th = self.threshold(site[0].kind);
+                        let close_second = sc.len() > 1 && best - sc[1] < self.cfg.mlm_gap;
+                        if self.cfg.mlm_choice_only {
+                            // 速度優先: 採否は n-gram で決め、確定した箇所の「どの案にするか」だけ MLM に聞く
+                            best >= th && close_second
+                        } else {
+                            let near_threshold = best < th + self.cfg.mlm_band;
+                            near_threshold || close_second
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let all: Vec<usize> = (0..works.len())
+            .filter(|&i| need[i].iter().any(|b| *b))
+            .collect();
+        let scores = self.mlm_scores(mlm, sents, works, &ng, &all, None, &need);
+        // 2 回目が必要な文
+        let mut fixed_all: Vec<Option<Vec<Option<usize>>>> = vec![None; works.len()];
+        for (&wi, sc) in all.iter().zip(&scores) {
+            let accepted: Vec<Option<usize>> = works[wi]
+                .iter()
+                .zip(sc)
+                .map(|(site, sc)| {
+                    let (bi, bs) = sc.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+                    (*bs >= self.threshold(site[bi].kind)).then_some(bi)
+                })
+                .collect();
+            if accepted.iter().filter(|a| a.is_some()).count() >= 2 {
+                fixed_all[wi] = Some(accepted);
+            }
+        }
+        // MLM を使わない箇所も、2 回目で「直した文脈」を作るために最良案を採用扱いにする
+        for (wi, fx) in fixed_all.iter_mut().enumerate() {
+            if let Some(fx) = fx {
+                for (si, site) in works[wi].iter().enumerate() {
+                    if !need[wi][si]
+                        && fx[si].is_none()
+                        && ng[wi][si][0] >= self.threshold(site[0].kind)
+                    {
+                        fx[si] = Some(0);
+                    }
+                }
+            }
+        }
+        let again: Vec<usize> = (0..works.len())
+            .filter(|&i| fixed_all[i].is_some())
+            .collect();
+        let scores2 = self.mlm_scores(mlm, sents, works, &ng, &again, Some(&fixed_all), &need);
+        let mut final_scores: FxHashMap<usize, Vec<Vec<f32>>> =
+            all.into_iter().zip(scores).collect();
+        for (wi, sc) in again.into_iter().zip(scores2) {
+            final_scores.insert(wi, sc);
+        }
+        for (wi, sc) in final_scores {
+            for (site, ss) in works[wi].iter_mut().zip(sc) {
+                for (f, s) in site.iter_mut().zip(ss) {
+                    f.delta = s;
+                }
+            }
+        }
+    }
+
+    /// `targets` の各文について、箇所ごと・候補ごとの最終スコアを返す。
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn mlm_scores(
+        &self,
+        mlm: &Mlm,
+        sents: &[&str],
+        works: &[Vec<Vec<Finding>>],
+        ng: &[Vec<Vec<f32>>],
+        targets: &[usize],
+        fixed: Option<&[Option<Vec<Option<usize>>>]>,
+        need: &[Vec<bool>],
+    ) -> Vec<Vec<Vec<f32>>> {
+        let mut texts: Vec<(String, usize, usize)> = Vec::new();
+        // (targets 内の番号, 箇所, 候補 or 元)
+        let mut index: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        for (ti, &wi) in targets.iter().enumerate() {
+            let chars: Vec<char> = sents[wi].chars().collect();
+            let sites = &works[wi];
+            let fx = fixed.and_then(|f| f[wi].as_ref());
+            for (si, site) in sites.iter().enumerate() {
+                if !need[wi][si] {
+                    continue;
+                }
+                // 土台の文 (fixed があれば、ほかの箇所を直したもの) と、この箇所の開始位置のずれ
+                let (base, shift) = match fx {
+                    None => (chars.clone(), 0isize),
+                    Some(fx) => {
+                        let mut out: Vec<char> = Vec::with_capacity(chars.len() + 4);
+                        let mut pos = 0;
+                        let mut shift = 0isize;
+                        for (sj, other) in sites.iter().enumerate() {
+                            let Some(bi) = fx[sj] else { continue };
+                            if sj == si {
+                                continue;
+                            }
+                            let f = &other[bi];
+                            out.extend_from_slice(&chars[pos..f.start]);
+                            out.extend(f.replacement.chars());
+                            if sj < si {
+                                shift += f.replacement.chars().count() as isize
+                                    - (f.end - f.start) as isize;
+                            }
+                            pos = f.end;
+                        }
+                        out.extend_from_slice(&chars[pos..]);
+                        (out, shift)
+                    }
+                };
+                let mv = |x: usize| (x as isize + shift) as usize;
+                let s0 = site.iter().map(|f| f.start).min().unwrap();
+                let s1 = site.iter().map(|f| f.end).max().unwrap();
+                texts.push((base.iter().collect(), mv(s0), mv(s1)));
+                index.push((ti, si, None));
+                for (ci, f) in site.iter().enumerate() {
+                    let (a, b) = (mv(f.start), mv(f.end));
+                    let mut t: String = base[..a].iter().collect();
+                    t.push_str(&f.replacement);
+                    t.extend(base[b..].iter());
+                    // 比べる範囲は「箇所全体」を編集後の座標で表したもの
+                    let grow = f.replacement.chars().count() as isize - (f.end - f.start) as isize;
+                    let e1 = (mv(s1) as isize + grow).max(mv(s0) as isize) as usize;
+                    texts.push((t, mv(s0), e1));
+                    index.push((ti, si, Some(ci)));
+                }
+            }
+        }
+        let qs: Vec<Query> = texts
+            .iter()
+            .map(|(t, a, b)| Query {
+                text: t,
+                start: *a,
+                end: *b,
+            })
+            .collect();
+        let pll = if self.cfg.mlm_pll {
+            mlm.window_pll(&qs, self.cfg.mlm_margin)
+        } else {
+            // 穴埋め採点は直す範囲だけをマスクする (前後の語は文脈として見せる)
+            mlm.fill_scores(&qs, self.cfg.mlm_margin)
+        }
+        .unwrap_or_else(|_| vec![(0.0, 0); qs.len()]);
+        let mut out: Vec<Vec<Vec<f32>>> = targets.iter().map(|&wi| ng[wi].clone()).collect();
+        let mut orig = (0f32, 0usize);
+        for ((ti, si, ci), (p, n)) in index.iter().zip(&pll) {
+            match ci {
+                None => orig = (*p, *n),
+                Some(ci) => {
+                    // 削除は採点対象のサブワードが減るぶん PLL が有利になるので、1 サブワードあたり
+                    // length_penalty (nats) を差し引いて釣り合わせる
+                    let d =
+                        (p - orig.0) + self.cfg.mlm_length_penalty * (*n as f32 - orig.1 as f32);
+                    let wi = targets[*ti];
+                    out[*ti][*si][*ci] =
+                        ng[wi][*si][*ci] + self.cfg.mlm_weight * d / std::f32::consts::LN_10;
+                }
+            }
+        }
+        out
     }
 
     /// 指摘箇所の前後 2 文字を含む元の文字列が、文書内に何回出てくるか (`extra` は外部から足す回数)。
@@ -216,74 +568,12 @@ impl Checker {
         doc.matches(ctx.as_str()).count() + extra
     }
 
-    /// 正規化済みの 1 文を検査する。
-    pub fn check_sentence(&self, sent: &str) -> Vec<Finding> {
-        let toks = self.tok.tokenize(sent);
-        if toks.is_empty() {
-            return Vec::new();
-        }
-        // S = <s> w1 .. wn </s>
-        let ids = self.ids_of(&toks);
-
-        // (Δ, Finding) を集めてから重なりを解消する
-        let mut scored: Vec<Finding> = Vec::new();
-        let mut buf: Vec<u32> = Vec::with_capacity(32);
-        for c in self.candidates(&toks) {
-            let repl_ids: Vec<u32> = c.repl.iter().map(|w| self.lm.word_id(w)).collect();
-            if repl_ids.contains(&UNK) {
-                continue;
-            }
-            let th = self
-                .cfg
-                .thresholds
-                .get(&c.kind)
-                .copied()
-                .unwrap_or(f32::INFINITY);
-            if !self.is_novel(&ids, c.a + 1, c.b + 1) {
-                continue;
-            }
-            let delta = self.delta(&ids, c.a + 1, c.b + 1, &repl_ids, &mut buf);
-            if delta >= th {
-                let start = toks
-                    .get(c.a)
-                    .map(|t| t.start)
-                    .unwrap_or_else(|| toks.last().unwrap().end);
-                let end = if c.b > c.a { toks[c.b - 1].end } else { start };
-                scored.push(Finding {
-                    start,
-                    end,
-                    original: toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect(),
-                    replacement: c.repl.concat(),
-                    kind: c.kind,
-                    delta,
-                });
-            }
-        }
-        if self
-            .cfg
+    fn threshold(&self, k: EditKind) -> f32 {
+        self.cfg
             .thresholds
-            .get(&EditKind::Char)
-            .is_some_and(|t| t.is_finite())
-        {
-            scored.extend(self.char_edits(sent, &toks, &ids));
-        }
-
-        // 重なる候補は Δ が最大のものだけ残す (挿入は幅 1 とみなす)。
-        // 隣接 (1 文字以内) も重なり扱いにする: 「飲食は店」で「は」を消す候補と「店」を消す候補は
-        // 同じ 1 つの誤りに対する別解なので、両方出すと誤検出になる。
-        scored.sort_by(|x, y| y.delta.total_cmp(&x.delta));
-        let mut taken: Vec<(usize, usize)> = Vec::new();
-        let mut out = Vec::new();
-        for f in scored {
-            let (a, b) = (f.start.saturating_sub(1), f.end.max(f.start + 1) + 1);
-            if taken.iter().any(|&(x, y)| a < y && x < b) {
-                continue;
-            }
-            taken.push((a, b));
-            out.push(f);
-        }
-        out.sort_by_key(|f| f.start);
-        out
+            .get(&k)
+            .copied()
+            .unwrap_or(f32::INFINITY)
     }
 
     fn ids_of(&self, toks: &[Token]) -> Vec<u32> {
@@ -365,6 +655,7 @@ impl Checker {
                     replacement: repl.to_string(),
                     kind: EditKind::Char,
                     delta,
+                    alternatives: Vec::new(),
                 });
             }
         };
@@ -470,7 +761,6 @@ impl Checker {
             }
             if matches!(t.pos.as_str(), "動詞" | "形容詞" | "助動詞")
                 && !t.conj_type.is_empty()
-                && t.conj_type != "*"
                 && let Some(forms) = self.inflections.get(&(t.base.clone(), t.conj_type.clone()))
             {
                 // 活用語 + 後続の助動詞列 (最大 2 つ) をまとめて置き換える
