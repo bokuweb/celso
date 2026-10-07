@@ -86,6 +86,13 @@ enum Cmd {
         output: PathBuf,
         inputs: Vec<PathBuf>,
     },
+    /// 活用表・同音異字表を、モデルの語彙にある語だけへ絞って書き出す (配布用)。
+    PruneTables {
+        #[command(flatten)]
+        m: ModelArgs,
+        #[arg(short, long)]
+        out_dir: PathBuf,
+    },
     /// テキストを検査する (ファイル省略時は stdin)。
     Check {
         #[command(flatten)]
@@ -256,6 +263,31 @@ const ALL_KINDS: [EditKind; 6] = [
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::PruneTables { m, out_dir } => {
+            let lm = lm::Model::load(&m.model)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let keep = |w: &str| lm.word_id(w) != lm::UNK;
+            for (src, name, col) in [
+                (&m.inflections, "inflections.tsv", 2usize),
+                (&m.readings, "readings.tsv", 1),
+            ] {
+                let mut w = BufWriter::new(std::fs::File::create(out_dir.join(name))?);
+                let mut n = 0;
+                for line in std::io::BufReader::new(std::fs::File::open(src)?).lines() {
+                    let line = line?;
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    let ok = cols.get(col).is_some_and(|w| keep(w))
+                        && (name != "readings.tsv"
+                            || cols.get(2).and_then(|c| c.parse::<u32>().ok()).unwrap_or(0) >= 20);
+                    if ok {
+                        writeln!(w, "{line}")?;
+                        n += 1;
+                    }
+                }
+                eprintln!("{name}: {n} lines");
+            }
+            Ok(())
+        }
         Cmd::BenchCache { m, file } => {
             let checker = m.load()?.with_cache();
             let text = std::fs::read_to_string(file)?;

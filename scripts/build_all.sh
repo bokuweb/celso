@@ -41,17 +41,23 @@ fi
 
 python3 scripts/extract_egov.py data/egov > data/corpus/egov.txt
 python3 scripts/extract_wiki.py data/jawiki1.xml.bz2 \
-  | python3 scripts/exclude_eval.py data/jwtd/test.jsonl > data/corpus/wiki1.f.txt
+  | python3 scripts/exclude_eval.py data/jwtd/test.jsonl data/jwtd/gold.jsonl > data/corpus/wiki1.f.txt
 # 5. 自治体の例規集 (30 自治体, robots.txt 準拠・低頻度で取得。横浜市は評価用なので含めない)
 #    他市にも横浜市市税条例と同じ文言の条文があるので、評価が甘くならないよう完全一致する文は除く
 python3 scripts/fetch_reiki.py
 python3 scripts/exclude_eval.py fixtures/yokohama_shizei_jorei.txt < data/corpus/reiki.txt > data/corpus/reiki.f.txt
 
+# 6. 分かち書き (各トークンを「表層形\x1f品詞クラス」で出し、語彙は後から選ぶ)
 for f in egov wiki1.f reiki.f; do
-  $BIN tokenize < "data/corpus/$f.txt" > "data/corpus/${f%.f}.wakati"
+  $BIN tokenize --with-class < "data/corpus/$f.txt" > "data/corpus/${f%.f}.wc"
 done
 cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
   | $BIN tokenize --inflections data/inflections.tsv --readings data/readings.tsv > /dev/null
 
-$BIN build-lm --order 4 --min-count 1,1,1,2 -o data/model.bin \
-  data/corpus/egov.wakati data/corpus/wiki1.wakati data/corpus/reiki.wakati
+# 7. 語彙 1 万語 + 品詞クラス、3-gram、強い足切りで配布用モデル (約 13MB) を作る
+$BIN vocab --size 10000 -o data/vocab10k.txt data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab10k.txt -o data/model.bin \
+  data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+# 8. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
+$BIN prune-tables --model data/model.bin -o data/dist
+cp data/model.bin data/dist/model.bin
