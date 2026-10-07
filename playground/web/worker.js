@@ -12,6 +12,9 @@ const ASSETS = [
   ['matrix', 'assets/matrix.def.gz'],
   ['char', 'assets/char.def.gz'],
   ['unk', 'assets/unk.def.gz'],
+  ['func', 'assets/func.bin.gz'],
+  ['rerank', 'assets/rerank.tsv.gz'],
+  ['patterns', 'assets/patterns.tsv.gz'],
 ];
 
 let playground = null;
@@ -69,7 +72,19 @@ async function load() {
   );
   const f = Object.fromEntries(files);
   post('progress', { phase: 'build' });
-  playground = new Playground(f.model, f.cooc, f.inflections, f.readings, f.lex, f.matrix, f.char, f.unk);
+  playground = new Playground(
+    f.model,
+    f.cooc,
+    f.inflections,
+    f.readings,
+    f.lex,
+    f.matrix,
+    f.char,
+    f.unk,
+    f.func,
+    f.rerank,
+    f.patterns,
+  );
   post('ready', { ms: Math.round(performance.now() - started) });
 }
 

@@ -1,58 +1,7 @@
 // celso playground の画面。検査は worker.js (WebAssembly) で行い、ここでは入力・強調表示・修正の適用だけを扱う。
 
-const SAMPLES = {
-  example: '西口側までは宿泊から施設や地元の日本酒や、山の幸を揃えた飲食は店、呑み屋など多くあろう',
-  contract: [
-    '第1条　甲は、乙に対し、本契約の定めるところにより、別紙記載の業務を委託し、乙はこれ受託する。',
-    '第2条　乙は、善良な管理者の注意をもって、本件業務を遂行しなければならない。',
-    '第3条　乙は、甲の書面による事前の承諾を得ないで、本件業務の全部又は一部を第三者に再委託してはならない。',
-    '第4条　乙の責めに帰すべき事由により甲に損害が生じたときは、乙はその損害を賠償する責任を追う。',
-    '第5条　本契約の有効機関は、契約締結の日から一年間とする。',
-    '第6条　本契約に定めのない事項については、甲乙誠意をもって協議の上で解決する。',
-  ].join('\n'),
-  ordinance: [
-    '（目的）',
-    '第1条　この条例は、地方税法の規定を基づき、市税の賦課徴収について必要な事項を定めるものとする。',
-    '（納税義務者）',
-    '第2条　市民税は、市内に住所を有する個人に対して課するのものとする。',
-    '第3条　市長は、前条を規定する者が納付すべき税額を決定し、これを納税者に通知しなければならない。',
-    '第4条　納税者は、納付書により市税を納付しなければならない。ただし、市長が特別の理由があると認める場合においては、この限りでない。',
-  ].join('\n'),
-  rules: [
-    '（兼業の禁止）',
-    '第10条　従業員は、会社の許可なく、他の会社の業務を従事してはならない。',
-    '（退職の手続）',
-    '第11条　従業員が退職しようとするときは、少なくとも30日前までに会社へ届け出なければならない。',
-    '（秘密保持）',
-    '第12条　従業員は、会社の秘密情報を在職中はもとより退職後も漏らしてはならない。',
-  ].join('\n'),
-  mail: [
-    '株式会社〇〇　営業部　〇〇様',
-    '',
-    'いつもお世話になっております。',
-    '先日は、お忙しいところ打ち合わせにご参加いただき、誠にありがとうございました。',
-    'ご提案いただいた案は、費用の面で課題がありため、再検討をお願いしたく存じます。',
-    '来週中に改めてご連絡させていただきますので、引き続きよろしくお願いいたします。',
-  ].join('\n'),
-  news: [
-    '市は、来年度から子育て支援を拡充する方針を固め、関連予算を議会の提出する。',
-    '新しい制度は、保護者の負担を軽減することを目的としてい。',
-    '市の担当者は「必要な家庭に支援が届くよう、周知に力を入れたい」と話している。',
-  ].join('\n'),
-  judgment: [
-    '主文',
-    '原告の請求を棄却する。',
-    '訴訟費用は原告の負担とする。',
-    '理由',
-    '原告の請求は理由がないから、これを棄却するとこととし、主文のとおり判決する。',
-  ].join('\n'),
-  paper: [
-    '本研究では、日本語の文章における誤字脱字の自動検出の手法を提案し、その有効性を検証した。',
-    '本手法は、大規模な学習データを必要としないという利点ある。',
-    '実験の結果、提案手法は従来手法よりも少ない計算量で同等の精度を示した。',
-  ].join('\n'),
-  clear: '',
-};
+// サンプル文は samples.json に置く (tests/regression.rs が同じファイルで「期待どおりに直るか」を確かめる)
+let samples = [];
 
 const KIND_LABELS = {
   delete: '余計な文字',
@@ -61,6 +10,7 @@ const KIND_LABELS = {
   insert: '文字の抜け',
   homophone: '変換ミス',
   char: '誤字',
+  pattern: '誤字',
 };
 
 const DOMAIN_LABELS = { legal: '法令文', contract: '契約書', general: '一般文' };
@@ -180,8 +130,9 @@ function findingItem(f, i) {
   ch.textContent = change(f.original, f.replacement, f.start === f.end);
   const score = document.createElement('span');
   score.className = 'score';
-  score.title = '編集による尤度の改善幅 (log10)';
-  score.textContent = `+${f.score.toFixed(1)}`;
+  // 判定器の対数オッズ・言語モデルの改善幅など、種類によって尺度が違うので目安として出す
+  score.title = '確からしさの目安 (大きいほど誤りの可能性が高い)';
+  score.textContent = f.score.toFixed(1);
   head.append(kind, ch, score);
 
   const choices = document.createElement('div');
@@ -231,13 +182,35 @@ input.addEventListener('input', () => {
   requestCheck();
 });
 
-for (const b of document.querySelectorAll('[data-sample]')) {
-  b.addEventListener('click', () => {
-    input.value = SAMPLES[b.dataset.sample] ?? '';
-    updateCount();
-    requestCheck(0);
-  });
+function setText(text) {
+  input.value = text;
+  updateCount();
+  requestCheck(0);
 }
 
-input.value = SAMPLES.example;
+// サンプルのボタンを samples.json から作る (最後に「クリア」)
+async function loadSamples() {
+  const box = $('samples');
+  try {
+    const res = await fetch('samples.json');
+    samples = await res.json();
+  } catch {
+    samples = [];
+  }
+  for (const s of samples) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = s.label;
+    b.addEventListener('click', () => setText(s.text));
+    box.append(b);
+  }
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.textContent = 'クリア';
+  clear.addEventListener('click', () => setText(''));
+  box.append(clear);
+  if (input.value === '' && samples.length > 0) setText(samples[0].text);
+}
+
 updateCount();
+loadSamples();

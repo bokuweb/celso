@@ -1,6 +1,7 @@
 //! celso をブラウザで動かす playground。
 //!
-//! モデル (CELSOLM4・共起モデル・活用表・同音異字表) と IPADIC の生ファイルをバイト列で受け取り、
+//! モデル (CELSOLM4・共起モデル・文法モデル・判定器・誤字パターン・活用表・同音異字表) と IPADIC の生ファイルを
+//! バイト列で受け取り、
 //! 純 Rust の分かち書き (delarocha) で検査する。ブラウザでは mmap できないので、モデルはメモリへ読む。
 //! 結果は JSON 文字列で返す (オフセットは Unicode スカラー値 = JS の `Array.from(text)` の添字)。
 
@@ -11,6 +12,8 @@ use celso::checker::{
 use celso::cooc::Cooc;
 use celso::lm::{Model, UNK};
 use celso::norm::norm;
+use celso::patterns::Patterns;
+use celso::rerank::Reranker;
 use celso::tokenize::Tokenizer;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -30,6 +33,12 @@ pub struct Assets<'a> {
     pub matrix_def: &'a [u8],
     pub char_def: &'a [u8],
     pub unk_def: &'a [u8],
+    /// 文法モデル (判定器の特徴量)。空なら使わない
+    pub func: &'a [u8],
+    /// 採否の判定器 (TSV)。空なら種類ごとの閾値で決める
+    pub rerank: &'a [u8],
+    /// 実際の誤字から集めた書き換えパターン (TSV)。空なら使わない
+    pub patterns: &'a [u8],
 }
 
 #[derive(Serialize)]
@@ -75,6 +84,15 @@ impl Engine {
             Checker::new(tok, Box::new(lm), Config::default(), inflections, readings).with_cache();
         if !a.cooc.is_empty() {
             checker = checker.with_cooc(Cooc::from_bytes(a.cooc)?);
+        }
+        if !a.func.is_empty() {
+            checker = checker.with_aux(Box::new(Model::from_bytes(a.func)?));
+        }
+        if !a.patterns.is_empty() {
+            checker = checker.with_patterns(Patterns::from_tsv(std::str::from_utf8(a.patterns)?)?);
+        }
+        if !a.rerank.is_empty() {
+            checker = checker.with_rerank(Reranker::from_tsv(std::str::from_utf8(a.rerank)?)?);
         }
         Ok(Self { checker })
     }
@@ -132,6 +150,9 @@ impl Playground {
         matrix_def: &[u8],
         char_def: &[u8],
         unk_def: &[u8],
+        func: &[u8],
+        rerank: &[u8],
+        patterns: &[u8],
     ) -> Result<Playground, JsValue> {
         Engine::load(Assets {
             model,
@@ -142,6 +163,9 @@ impl Playground {
             matrix_def,
             char_def,
             unk_def,
+            func,
+            rerank,
+            patterns,
         })
         .map(Playground)
         .map_err(|e| JsValue::from_str(&e.to_string()))

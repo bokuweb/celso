@@ -42,6 +42,9 @@ fn detects_the_example_sentence_with_pure_rust_tokenizer() {
         matrix_def: &matrix,
         char_def: &chardef,
         unk_def: &unkdef,
+        func: &read(&dist, "func.bin"),
+        rerank: &read(&dist, "rerank.tsv"),
+        patterns: &read(&dist, "patterns.tsv"),
     })
     .unwrap();
     eprintln!("loaded in {:?}", t.elapsed());
@@ -85,6 +88,9 @@ fn matches_native_findings_on_yokohama() {
         matrix_def: &matrix,
         char_def: &chardef,
         unk_def: &unkdef,
+        func: &read(&dist, "func.bin"),
+        rerank: &read(&dist, "rerank.tsv"),
+        patterns: &read(&dist, "patterns.tsv"),
     })
     .unwrap();
     let text = std::fs::read_to_string("../fixtures/yokohama_shizei_jorei.txt").unwrap();
@@ -107,4 +113,61 @@ fn matches_native_findings_on_yokohama() {
     got.sort();
     std::fs::write("/tmp/celso_pure_findings.txt", got.join("\n")).unwrap();
     eprintln!("{} findings", got.len());
+}
+
+#[test]
+#[ignore]
+fn samples_are_corrected_as_expected_with_pure_rust_tokenizer() {
+    // ブラウザと同じ純 Rust の分かち書きで、playground のサンプル (web/samples.json) が期待どおりに直ることを確かめる
+    // (ネイティブ版は celso の tests/regression.rs が確かめる)
+    let dist = PathBuf::from("../data/dist");
+    let raw = PathBuf::from(std::env::var("HOME").unwrap()).join("celso-data/ipadic-utf8");
+    let engine = Engine::load(Assets {
+        model: &read(&dist, "model.bin"),
+        cooc: read(&dist, "cooc.bin"),
+        inflections: &read(&dist, "inflections.tsv"),
+        readings: &read(&dist, "readings.tsv"),
+        lex_csv: &read(&raw, "lex.csv"),
+        matrix_def: &read(&raw, "matrix.def"),
+        char_def: &read(&raw, "char.def"),
+        unk_def: &read(&raw, "unk.def"),
+        func: &read(&dist, "func.bin"),
+        rerank: &read(&dist, "rerank.tsv"),
+        patterns: &read(&dist, "patterns.tsv"),
+    })
+    .unwrap();
+    let samples: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string("web/samples.json").unwrap()).unwrap();
+    let mut failures = Vec::new();
+    for s in samples.as_array().unwrap() {
+        let text = s["text"].as_str().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&engine.check_json(text)).unwrap();
+        let mut chars: Vec<char> = text.chars().collect();
+        let mut findings: Vec<(usize, usize, String)> = json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["start"].as_u64().unwrap() as usize,
+                    f["end"].as_u64().unwrap() as usize,
+                    f["replacement"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        findings.sort();
+        for (a, b, r) in findings.iter().rev() {
+            chars.splice(*a..*b, r.chars());
+        }
+        let got: String = chars.into_iter().collect();
+        if !s["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str() == Some(got.as_str()))
+        {
+            failures.push(format!("{}: {got}", s["id"]));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

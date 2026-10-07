@@ -15,7 +15,7 @@
       <div class="wrap">
         <h1>celso <span class="sub">playground</span></h1>
         <p class="lead">
-          余計な助詞・助詞の取り違え・活用の誤り・助詞の脱落・漢字の変換ミスを、ブラウザの中だけで検出します。
+          余計な助詞・助詞の取り違え・活用の誤り・助詞の脱落・漢字の変換ミス・よくある打ち間違いを、ブラウザの中だけで検出します。
           入力した文章はどこにも送信されません。
         </p>
       </div>
@@ -27,17 +27,8 @@
         <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
       </section>
 
-      <div class="samples" role="group" aria-label="サンプル文">
+      <div class="samples" id="samples" role="group" aria-label="サンプル文">
         <span class="samples-label">サンプル:</span>
-        <button type="button" data-sample="example">観光案内</button>
-        <button type="button" data-sample="contract">契約書</button>
-        <button type="button" data-sample="ordinance">条例</button>
-        <button type="button" data-sample="rules">社内規程</button>
-        <button type="button" data-sample="mail">メール</button>
-        <button type="button" data-sample="news">行政・ニュース</button>
-        <button type="button" data-sample="judgment">判決文</button>
-        <button type="button" data-sample="paper">論文</button>
-        <button type="button" data-sample="clear">クリア</button>
       </div>
 
       <div class="panes">
@@ -64,17 +55,23 @@
         <p>
           よくある誤りを元に戻す修正候補を作り、単語 3-gram 言語モデルで編集前後の尤度を比べて判定します。
           同音異字の誤変換だけは、同じ文に出やすい語 (共起) も足して判定します。
+          候補を採るかどうかは、助詞の種類・前後の品詞・助詞の並び (文法モデル) などを特徴量にした判定器で決めます。
+          「をを」「れいる」のような打ち間違いは、日本語 Wikipedia の編集履歴から集めたパターンと照合します。
           分かち書きは <a href="https://github.com/bokuweb/delarocha">delarocha</a> (IPADIC) を WebAssembly で動かしています。
           詳しくは <a href="https://github.com/bokuweb/celso">bokuweb/celso</a> を参照してください。
         </p>
         <ul class="notes">
-          <li>初回はモデルと辞書 (約 27MB) を読み込むため時間がかかります。2 回目以降はブラウザのキャッシュが効きます。</li>
+          <li>初回はモデルと辞書 (約 30MB) を読み込むため時間がかかります。2 回目以降はブラウザのキャッシュが効きます。</li>
           <li>文書の種類 (契約書・法令文・一般文) を自動で判定し、判定の厳しさを切り替えます。</li>
           <li>
             学習コーパス: e-Gov 法令データ、Wikipedia 日本語版、自治体の例規集、官公庁のモデル契約書など。
             モデルが持つのは n-gram と共起の統計だけで、元の文は含みません。
           </li>
           <li>辞書: IPADIC (<a href="IPADIC-COPYING.txt">ライセンス</a>)</li>
+          <li>
+            誤字パターン: 京都大学 日本語 Wikipedia 入力誤りデータセット (JWTD) から作成
+            (元データは <a href="https://creativecommons.org/licenses/by-sa/3.0/deed.ja">CC BY-SA 3.0</a>)
+          </li>
         </ul>
       </section>
     </main>
