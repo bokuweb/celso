@@ -38,13 +38,15 @@ pub struct Token {
     /// 入力テキスト内の文字オフセット (半開区間)。
     pub start: usize,
     pub end: usize,
-    pub pos: String,
-    pub pos1: String,
-    pub conj_type: String,
-    pub conj_form: String,
-    pub base: String,
-    /// 読み (カタカナ)。同音異字の候補引きに使う。未知語は空。
-    pub reading: String,
+    // 品詞・活用の情報は種類が少ないので共有の文字列 (intern) にし、トークンごとに確保しない
+    pub pos: &'static str,
+    pub pos1: &'static str,
+    pub conj_type: &'static str,
+    pub conj_form: &'static str,
+    /// 原形。活用語 (動詞・形容詞・助動詞) だけ持つ (活用候補の表引きにしか使わないため)。
+    pub base: &'static str,
+    /// 読み (カタカナ)。同音異字の候補引きにしか使わないので、漢字を含む内容語だけ持つ。
+    pub reading: &'static str,
 }
 
 impl Token {
@@ -75,11 +77,87 @@ impl Token {
     }
 }
 
+/// 品詞・活用形・原形の文字列を共有する。種類は辞書の範囲に限られる (数千程度) ので、
+/// 一度確保したものを使い回してトークンごとの確保をなくす。
+fn intern(s: &str) -> &'static str {
+    use std::sync::RwLock;
+    static TABLE: OnceLock<RwLock<rustc_hash::FxHashSet<&'static str>>> = OnceLock::new();
+    if s.is_empty() || s == "*" {
+        return "";
+    }
+    let t = TABLE.get_or_init(Default::default);
+    if let Some(v) = t.read().unwrap().get(s) {
+        return v;
+    }
+    let mut w = t.write().unwrap();
+    if let Some(v) = w.get(s) {
+        return v;
+    }
+    let v: &'static str = Box::leak(s.to_string().into_boxed_str());
+    w.insert(v);
+    v
+}
+
+fn has_kanji(s: &str) -> bool {
+    s.chars()
+        .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || c == '々')
+}
+
 // 辞書はプロセスで 1 つだけ読み、ワーカーがそれを 'static で借りる
 static DICT: OnceLock<ZigTokenizer> = OnceLock::new();
 
 thread_local! {
     static WORKER: RefCell<Option<ZigWorker<'static>>> = const { RefCell::new(None) };
+    /// 語 ID → 解析済みの品詞情報。同じ語は同じ feature を持つので、文字列の分割と intern を
+    /// 語ごとに 1 回で済ませる (トークンの組み立てが分かち書き本体より重かったため)。
+    static FEATS: RefCell<rustc_hash::FxHashMap<u32, Feat>> = RefCell::new(Default::default());
+}
+
+/// キャッシュの上限 (語の種類数)。長時間動くサーバーで際限なく増えないよう、超えたら捨てる。
+const FEAT_CACHE_LIMIT: usize = 100_000;
+
+#[derive(Clone, Copy)]
+struct Feat {
+    pos: &'static str,
+    pos1: &'static str,
+    conj_type: &'static str,
+    conj_form: &'static str,
+    base: &'static str,
+    /// 漢字を含む内容語の読み (それ以外は空)。未知語は surface 依存なので使わない
+    reading: &'static str,
+}
+
+fn parse_feat(feature: &str, surface: &str) -> Feat {
+    let mut f = feature.split(',');
+    let mut next = || f.next().filter(|s| *s != "*").unwrap_or("");
+    let (pos, pos1, _p2, _p3, conj_type, conj_form, base, reading) = (
+        next(),
+        next(),
+        next(),
+        next(),
+        next(),
+        next(),
+        next(),
+        next(),
+    );
+    let pos = intern(pos);
+    let content = matches!(pos, "名詞" | "動詞" | "形容詞" | "副詞");
+    Feat {
+        pos,
+        pos1: intern(pos1),
+        conj_type: intern(conj_type),
+        conj_form: intern(conj_form),
+        base: if conj_type.is_empty() {
+            ""
+        } else {
+            intern(base)
+        },
+        reading: if content && has_kanji(surface) {
+            intern(reading)
+        } else {
+            ""
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -123,28 +201,35 @@ impl Tokenizer {
                 if surface.trim().is_empty() {
                     continue;
                 }
-                let mut f = v.feature().split(',');
-                let mut next = || f.next().filter(|s| *s != "*").unwrap_or("").to_string();
-                let (pos, pos1, _p2, _p3, conj_type, conj_form, base, reading) = (
-                    next(),
-                    next(),
-                    next(),
-                    next(),
-                    next(),
-                    next(),
-                    next(),
-                    next(),
-                );
+                // 未知語の feature は文字種ごとに共通なので語 ID ではキャッシュできるが、
+                // 読みは持たない (has_kanji の判定が surface 依存になるため、未知語は毎回解析する)
+                let wid = v.word_id();
+                let feat = if v.is_unknown() {
+                    parse_feat(v.feature(), surface)
+                } else {
+                    FEATS.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if let Some(f) = c.get(&wid) {
+                            return *f;
+                        }
+                        if c.len() >= FEAT_CACHE_LIMIT {
+                            c.clear();
+                        }
+                        let f = parse_feat(v.feature(), surface);
+                        c.insert(wid, f);
+                        f
+                    })
+                };
                 let tok = Token {
                     surface: surface.to_string(),
                     start: v.start_char,
                     end: v.end_char,
-                    pos,
-                    pos1,
-                    conj_type,
-                    conj_form,
-                    base,
-                    reading,
+                    pos: feat.pos,
+                    pos1: feat.pos1,
+                    conj_type: feat.conj_type,
+                    conj_form: feat.conj_form,
+                    base: feat.base,
+                    reading: feat.reading,
                 };
                 // 「1」「,」「500」のように割れた数字列を 1 トークンへまとめる
                 if let Some(prev) = out.last_mut()

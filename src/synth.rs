@@ -73,8 +73,7 @@ pub fn corrupt(
         EditKind::Delete => {
             let idx: Vec<usize> = (0..toks.len().saturating_sub(1))
                 .filter(|&i| {
-                    toks[i].pos == "名詞"
-                        && matches!(toks[i + 1].pos.as_str(), "名詞" | "動詞" | "形容詞")
+                    toks[i].pos == "名詞" && matches!(toks[i + 1].pos, "名詞" | "動詞" | "形容詞")
                 })
                 .collect();
             let i = pick(rng, &idx)?;
@@ -92,9 +91,7 @@ pub fn corrupt(
         // 助詞を落とす → 直しは挿入
         EditKind::Insert => {
             let idx: Vec<usize> = (1..toks.len())
-                .filter(|&i| {
-                    toks[i].pos == "助詞" && matches!(toks[i].pos1.as_str(), "格助詞" | "係助詞")
-                })
+                .filter(|&i| toks[i].pos == "助詞" && matches!(toks[i].pos1, "格助詞" | "係助詞"))
                 .collect();
             let i = pick(rng, &idx)?;
             Some(Example {
@@ -108,9 +105,7 @@ pub fn corrupt(
         }
         EditKind::Substitute => {
             let idx: Vec<usize> = (0..toks.len())
-                .filter(|&i| {
-                    toks[i].pos == "助詞" && matches!(toks[i].pos1.as_str(), "格助詞" | "係助詞")
-                })
+                .filter(|&i| toks[i].pos == "助詞" && matches!(toks[i].pos1, "格助詞" | "係助詞"))
                 .collect();
             let i = pick(rng, &idx)?;
             let p = loop {
@@ -131,14 +126,14 @@ pub fn corrupt(
         EditKind::Inflection => {
             let idx: Vec<usize> = (0..toks.len())
                 .filter(|&i| {
-                    matches!(toks[i].pos.as_str(), "動詞" | "形容詞")
+                    matches!(toks[i].pos, "動詞" | "形容詞")
                         && infl
-                            .get(&(toks[i].base.clone(), toks[i].conj_type.clone()))
+                            .get(&(toks[i].base.to_string(), toks[i].conj_type.to_string()))
                             .is_some_and(|f| f.len() > 1)
                 })
                 .collect();
             let i = pick(rng, &idx)?;
-            let forms = &infl[&(toks[i].base.clone(), toks[i].conj_type.clone())];
+            let forms = &infl[&(toks[i].base.to_string(), toks[i].conj_type.to_string())];
             let f = loop {
                 let f = &forms[rng.below(forms.len())];
                 if *f != toks[i].surface {

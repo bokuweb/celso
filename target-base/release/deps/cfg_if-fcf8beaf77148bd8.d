@@ -1,0 +1,7 @@
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/cfg_if-fcf8beaf77148bd8.d: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs
+
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/libcfg_if-fcf8beaf77148bd8.rlib: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs
+
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/libcfg_if-fcf8beaf77148bd8.rmeta: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs
+
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs:

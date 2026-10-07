@@ -198,6 +198,18 @@ const PARTICLES: &[&str] = &[
     "が", "の", "を", "に", "へ", "と", "で", "から", "まで", "より", "は", "も", "や", "て", "ば",
     "し", "ので", "のに",
 ];
+/// 法令文で使う複合助詞 (IPADIC では 1 語)。取り違えの置換先と、脱落の補完に使う。
+const COMPOUND_PARTICLES: &[&str] = &[
+    "について",
+    "による",
+    "により",
+    "によって",
+    "において",
+    "に関する",
+    "に対する",
+    "に対して",
+    "に係る",
+];
 /// 文字単位の脱字として補うかな。
 const INSERT_KANA: &[&str] = &[
     "い", "て", "の", "に", "を", "が", "し", "た", "る", "な", "っ", "ん", "か", "と", "で", "は",
@@ -213,7 +225,9 @@ fn is_kana(c: char) -> bool {
 }
 
 /// 挿入候補にする助詞。
-const INSERT_PARTICLES: &[&str] = &["の", "を", "に", "が", "は", "で", "と"];
+const INSERT_PARTICLES: &[&str] = &[
+    "の", "を", "に", "が", "は", "で", "と", "から", "まで", "も",
+];
 
 pub struct Checker {
     pub tok: Tokenizer,
@@ -242,10 +256,11 @@ fn sentence_key(s: &str, d: Domain) -> u64 {
     h.finish()
 }
 
-struct Cand {
+/// 修正候補。置き換え先は常に 1 語以下なので、借用した文字列 1 つで持つ (候補ごとの確保をなくす)。
+struct Cand<'a> {
     a: usize,
     b: usize,
-    repl: Vec<String>,
+    repl: Option<&'a str>,
     kind: EditKind,
 }
 
@@ -431,16 +446,25 @@ impl Checker {
 
         let mut cands: Vec<Finding> = Vec::new();
         let mut buf: Vec<u32> = Vec::with_capacity(32);
+        let mut repl_buf = [0u32; 1];
+        // 未出現ゲートの判定は語の位置ごとに 1 回だけ行い、候補間で使い回す
+        let novel = self.novel_positions(&ids);
         for c in self.candidates(&toks) {
-            let repl_ids: Vec<u32> = c.repl.iter().map(|w| self.lm.word_id(w)).collect();
+            let repl_ids: &[u32] = match c.repl {
+                None => &[],
+                Some(w) => {
+                    repl_buf[0] = self.lm.word_id(w);
+                    &repl_buf
+                }
+            };
             if repl_ids.contains(&UNK) {
                 continue;
             }
             let th = self.threshold(c.kind, d) - slack;
-            if !th.is_finite() || !self.is_novel(&ids, c.a + 1, c.b + 1) {
+            if !th.is_finite() || !Self::is_novel(&ids, &novel, c.a + 1, c.b + 1) {
                 continue;
             }
-            let delta = self.delta(&ids, c.a + 1, c.b + 1, &repl_ids, &mut buf);
+            let delta = self.delta(&ids, c.a + 1, c.b + 1, repl_ids, &mut buf);
             if delta >= th {
                 let start = toks
                     .get(c.a)
@@ -451,7 +475,7 @@ impl Checker {
                     start,
                     end,
                     original: toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect(),
-                    replacement: c.repl.concat(),
+                    replacement: c.repl.unwrap_or("").to_string(),
                     kind: c.kind,
                     delta,
                     alternatives: Vec::new(),
@@ -849,21 +873,28 @@ impl Checker {
 
     /// 元の文の S[a-1 .. b+1] 付近に、コーパスで見たことのない並びがあるか。
     /// 語彙外の語が隣接している場合は判断できないので false (指摘しない) にする。
-    fn is_novel(&self, s: &[u32], a: usize, b: usize) -> bool {
-        let n = self.cfg.novelty_order;
-        if n == 0 {
-            return true;
-        }
+    fn is_novel(s: &[u32], novel: &[bool], a: usize, b: usize) -> bool {
         let lo = a.saturating_sub(1);
         let hi = (b + 2).min(s.len());
         if s[lo..hi].contains(&UNK) {
             return false;
         }
-        // 編集箇所の語と、その直後 2 語までを、直前 n-1 語の文脈で予測したときに完全一致があるか
-        (a..hi).any(|j| {
-            let ctx = &s[j.saturating_sub(n - 1)..j];
-            self.lm.match_order(ctx, s[j]) < n.min(ctx.len() + 1)
-        })
+        novel[a..hi].iter().any(|v| *v)
+    }
+
+    /// S の各位置 j について、直前 n-1 語の文脈で予測したとき完全一致する n-gram が無いか。
+    /// 編集箇所の語と、その直後 2 語までのどこかが未出現なら、その候補を評価する。
+    fn novel_positions(&self, s: &[u32]) -> Vec<bool> {
+        let n = self.cfg.novelty_order;
+        (0..s.len())
+            .map(|j| {
+                if n == 0 {
+                    return true;
+                }
+                let ctx = &s[j.saturating_sub(n - 1)..j];
+                self.lm.match_order(ctx, s[j]) < n.min(ctx.len() + 1)
+            })
+            .collect()
     }
 
     /// S[a..b] を repl に置き換えたときの対数確率の改善幅。
@@ -891,7 +922,7 @@ impl Checker {
         new - orig
     }
 
-    fn candidates(&self, toks: &[Token]) -> Vec<Cand> {
+    fn candidates(&self, toks: &[Token]) -> Vec<Cand<'_>> {
         let mut out = Vec::new();
         for (i, t) in toks.iter().enumerate() {
             let is_particle = t.pos == "助詞";
@@ -901,7 +932,7 @@ impl Checker {
             let is_hira1 = t.surface.chars().count() == 1
                 && t.surface.chars().all(|c| ('ぁ'..='ん').contains(&c))
                 && !matches!(
-                    t.pos.as_str(),
+                    t.pos,
                     "名詞" | "動詞" | "形容詞" | "接頭詞" | "副詞" | "連体詞"
                 );
             let dup = i > 0 && toks[i - 1].surface == t.surface && t.pos != "名詞";
@@ -909,26 +940,29 @@ impl Checker {
                 out.push(Cand {
                     a: i,
                     b: i + 1,
-                    repl: vec![],
+                    repl: None,
                     kind: EditKind::Delete,
                 });
             }
-            // 置換は単純な助詞どうしに限る (「によって」→「に」のような複合助詞の言い換えは正しい文でも高得点になる)
+            // 置換元は単純な助詞に限る (「によって」→「に」のような複合助詞の言い換えは正しい文でも高得点になる)。
+            // 置換先には法令文で使う複合助詞も含める (「市民税[が]経過措置」→「に関する」)
             if is_simple_particle {
-                for p in PARTICLES {
+                for p in PARTICLES.iter().chain(COMPOUND_PARTICLES) {
                     if *p != t.surface {
                         out.push(Cand {
                             a: i,
                             b: i + 1,
-                            repl: vec![p.to_string()],
+                            repl: Some(p),
                             kind: EditKind::Substitute,
                         });
                     }
                 }
             }
-            if matches!(t.pos.as_str(), "動詞" | "形容詞" | "助動詞")
+            if matches!(t.pos, "動詞" | "形容詞" | "助動詞")
                 && !t.conj_type.is_empty()
-                && let Some(forms) = self.inflections.get(&(t.base.clone(), t.conj_type.clone()))
+                && let Some(forms) = self
+                    .inflections
+                    .get(&(t.base.to_string(), t.conj_type.to_string()))
             {
                 // 活用語 + 後続の助動詞列 (最大 2 つ) をまとめて置き換える
                 let mut j = i + 1;
@@ -943,7 +977,7 @@ impl Checker {
                     // 元の文も正しいことがほとんどで誤検出になる (「交わした」→「交わす」)。
                     if toks[i + 1..b]
                         .iter()
-                        .any(|x| !matches!(x.base.as_str(), "う" | "よう"))
+                        .any(|x| !matches!(x.base, "う" | "よう"))
                     {
                         continue;
                     }
@@ -954,16 +988,16 @@ impl Checker {
                         out.push(Cand {
                             a: i,
                             b,
-                            repl: vec![f.clone()],
+                            repl: Some(f.as_str()),
                             kind: EditKind::Inflection,
                         });
                     }
                 }
             }
 
-            if matches!(t.pos.as_str(), "名詞" | "動詞" | "形容詞" | "副詞")
+            if matches!(t.pos, "名詞" | "動詞" | "形容詞" | "副詞")
                 && !t.reading.is_empty()
-                && let Some(alts) = self.readings.get(&t.reading)
+                && let Some(alts) = self.readings.get(t.reading)
             {
                 // 誤変換 (別の漢字) だけを狙う。かな書き→漢字 (かかる→係る) や送り仮名違い (当り→当たり) は
                 // 誤字ではなく表記ゆれなので出さない。1 文字の語は同音が多すぎて誤検出が増えるので除く。
@@ -979,23 +1013,24 @@ impl Checker {
                         out.push(Cand {
                             a: i,
                             b: i + 1,
-                            repl: vec![alt.clone()],
+                            repl: Some(alt.as_str()),
                             kind: EditKind::Homophone,
                         });
                     }
                 }
             }
-            if self.cfg.enable_insert
-                && i > 0
-                && toks[i - 1].pos == "名詞"
-                && t.pos != "助詞"
-                && t.pos != "記号"
-            {
-                for p in INSERT_PARTICLES {
+            // 名詞 (または閉じ括弧「」」「)」) の直後で、次が助詞でも記号でもない位置か、読点の直前に補う
+            // (「この条例□、公布の日から」「『納税義務者』□いう」)
+            let prev_ok = i > 0
+                && (toks[i - 1].pos == "名詞"
+                    || (toks[i - 1].pos == "記号" && toks[i - 1].pos1 == "括弧閉"));
+            let next_ok = t.pos != "助詞" && (t.pos != "記号" || t.pos1 == "読点");
+            if self.cfg.enable_insert && prev_ok && next_ok {
+                for p in INSERT_PARTICLES.iter().chain(COMPOUND_PARTICLES) {
                     out.push(Cand {
                         a: i,
                         b: i,
-                        repl: vec![p.to_string()],
+                        repl: Some(p),
                         kind: EditKind::Insert,
                     });
                 }

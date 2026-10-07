@@ -1,0 +1,14 @@
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/serde-9341366b7bdb2e2e.d: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/build/serde-eebd739c130e40fc/out/private.rs
+
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/libserde-9341366b7bdb2e2e.rlib: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/build/serde-eebd739c130e40fc/out/private.rs
+
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/deps/libserde-9341366b7bdb2e2e.rmeta: /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/build/serde-eebd739c130e40fc/out/private.rs
+
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/build/serde-eebd739c130e40fc/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/bokuweb/ghq/github.com/bokuweb/celso/target-base/release/build/serde-eebd739c130e40fc/out

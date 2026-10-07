@@ -544,16 +544,19 @@ fn tokenize_cmd(
                             s.push('\x1f');
                             s.push_str(&t.class_key());
                         }
-                        if matches!(t.pos.as_str(), "動詞" | "形容詞" | "助動詞")
-                            && !t.conj_type.is_empty()
+                        if matches!(t.pos, "動詞" | "形容詞" | "助動詞") && !t.conj_type.is_empty()
                         {
-                            inf.push((t.base.clone(), t.conj_type.clone(), t.surface.clone()));
+                            inf.push((
+                                t.base.to_string(),
+                                t.conj_type.to_string(),
+                                t.surface.clone(),
+                            ));
                         }
-                        if matches!(t.pos.as_str(), "名詞" | "動詞" | "形容詞" | "副詞")
+                        if matches!(t.pos, "名詞" | "動詞" | "形容詞" | "副詞")
                             && !t.reading.is_empty()
                             && t.surface.chars().any(is_kanji)
                         {
-                            rd.push((t.reading.clone(), t.surface.clone()));
+                            rd.push((t.reading.to_string(), t.surface.clone()));
                         }
                     }
                     (s, inf, rd)
@@ -735,6 +738,32 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
         }
     }
 
+    // 取りこぼしの例 (CELSO_SHOW_MISS=insert などで種類を指定)
+    if let Ok(kind) = std::env::var("CELSO_SHOW_MISS") {
+        let mut shown = 0;
+        for (e, fs) in examples.iter().zip(&results) {
+            if e.kind.label() != kind || shown >= 30 {
+                continue;
+            }
+            let hit = fs
+                .iter()
+                .any(|f| f.start <= e.gold_end + 1 && e.gold_start <= f.end + 1);
+            if !hit {
+                let chars: Vec<char> = e.text.chars().collect();
+                let a = e.gold_start.saturating_sub(10);
+                let b = (e.gold_end + 10).min(chars.len());
+                let ctx: String = chars[a..e.gold_start].iter().collect::<String>()
+                    + "["
+                    + &chars[e.gold_start..e.gold_end].iter().collect::<String>()
+                    + "→"
+                    + &e.gold_repl
+                    + "]"
+                    + &chars[e.gold_end..b].iter().collect::<String>();
+                println!("  MISS {kind}: {ctx}");
+                shown += 1;
+            }
+        }
+    }
     println!("kind        n    detect  correct  other-fp");
     for k in kinds {
         let (mut total, mut det, mut cor, mut other) = (0, 0, 0, 0);

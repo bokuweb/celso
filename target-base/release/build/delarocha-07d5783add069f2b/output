@@ -1,0 +1,6 @@
+cargo:rerun-if-env-changed=CARGO_FEATURE_ZIG_FFI
+cargo:rerun-if-env-changed=DELAROCHA_BUILD_ZIG
+cargo:rerun-if-env-changed=DOCS_RS
+cargo:rerun-if-changed=prebuilt
+cargo:rustc-link-search=native=/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/delarocha-0.1.1/prebuilt/aarch64-apple-darwin
+cargo:rustc-link-lib=static=delarocha_zig
