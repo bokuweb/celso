@@ -536,7 +536,7 @@ fn tokenize_cmd(
                         }
                         match &vocab {
                             Some(v) if !t.is_num() && !v.contains(t.surface.as_str()) => {
-                                s.push_str(&t.class_key())
+                                s.push_str(&t.class_key());
                             }
                             _ => s.push_str(t.key()),
                         }

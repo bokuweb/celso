@@ -110,7 +110,7 @@ thread_local! {
     static WORKER: RefCell<Option<ZigWorker<'static>>> = const { RefCell::new(None) };
     /// 語 ID → 解析済みの品詞情報。同じ語は同じ feature を持つので、文字列の分割と intern を
     /// 語ごとに 1 回で済ませる (トークンの組み立てが分かち書き本体より重かったため)。
-    static FEATS: RefCell<rustc_hash::FxHashMap<u32, Feat>> = RefCell::new(Default::default());
+    static FEATS: RefCell<rustc_hash::FxHashMap<u32, Feat>> = RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 /// キャッシュの上限 (語の種類数)。長時間動くサーバーで際限なく増えないよう、超えたら捨てる。

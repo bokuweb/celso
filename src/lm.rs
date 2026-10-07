@@ -155,10 +155,10 @@ pub trait LanguageModel: Send + Sync {
     /// トークンの語 ID。語彙に無ければ品詞クラスの ID (学習時に語彙外を品詞クラスへ置き換えている)。
     fn token_id(&self, t: &crate::tokenize::Token) -> u32 {
         let id = self.word_id(t.key());
-        if id != UNK {
-            id
-        } else {
+        if id == UNK {
             self.word_id(&t.class_key())
+        } else {
+            id
         }
     }
 }
