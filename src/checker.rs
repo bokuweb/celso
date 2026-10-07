@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::lm::{BOS, EOS, Model, UNK};
+use crate::lm::{BOS, EOS, LanguageModel, UNK};
 use crate::mlm::{Mlm, Query};
 use crate::norm::norm;
 use crate::tokenize::{Token, Tokenizer};
@@ -204,7 +204,7 @@ const INSERT_PARTICLES: &[&str] = &["の", "を", "に", "が", "は", "で", "�
 
 pub struct Checker {
     pub tok: Tokenizer,
-    pub lm: Model,
+    pub lm: Box<dyn LanguageModel>,
     pub cfg: Config,
     /// (原形, 活用型) → その語の活用した表層形の一覧
     inflections: FxHashMap<(String, String), Vec<String>>,
@@ -239,7 +239,7 @@ struct Cand {
 impl Checker {
     pub fn new(
         tok: Tokenizer,
-        lm: Model,
+        lm: Box<dyn LanguageModel>,
         cfg: Config,
         inflections: FxHashMap<(String, String), Vec<String>>,
         readings: FxHashMap<String, Vec<(String, u32)>>,
@@ -721,13 +721,13 @@ impl Checker {
     fn ids_of(&self, toks: &[Token]) -> Vec<u32> {
         let mut ids: Vec<u32> = Vec::with_capacity(toks.len() + 2);
         ids.push(BOS);
-        ids.extend(toks.iter().map(|t| self.lm.word_id(t.key())));
+        ids.extend(toks.iter().map(|t| self.lm.token_id(t)));
         ids.push(EOS);
         ids
     }
 
     fn sentence_logp(&self, ids: &[u32]) -> f32 {
-        let order = self.lm.order;
+        let order = self.lm.order();
         (1..ids.len())
             .map(|j| self.lm.logp(&ids[j.saturating_sub(order - 1)..j], ids[j]))
             .sum()
@@ -747,7 +747,7 @@ impl Checker {
                 || t.surface
                     .chars()
                     .all(|c| is_kana(c) && !('ぁ'..='ゖ').contains(&c))
-                || self.lm.word_id(t.key()) == UNK
+                || self.lm.token_id(t) == UNK
         };
         for j in 1..ids.len() - 1 {
             if ids[j] == UNK || ids[j - 1] == UNK {
@@ -848,7 +848,7 @@ impl Checker {
 
     /// S[a..b] を repl に置き換えたときの対数確率の改善幅。
     fn delta(&self, s: &[u32], a: usize, b: usize, repl: &[u32], buf: &mut Vec<u32>) -> f32 {
-        let order = self.lm.order;
+        let order = self.lm.order();
         let ctx_start = a.saturating_sub(order - 1);
         // 元: S[a .. b + order - 1) を採点 (文末で打ち切り)
         let tail_end = (b + order - 1).min(s.len());

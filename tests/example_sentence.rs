@@ -18,7 +18,7 @@ fn detects_all_errors_in_example_sentence() {
     };
     let checker = Checker::new(
         Tokenizer::new().unwrap(),
-        Model::load(model).unwrap(),
+        Box::new(Model::load(model).unwrap()),
         cfg,
         load_inflections(Path::new("data/inflections.tsv")).unwrap(),
         load_readings(Path::new("data/readings.tsv")).unwrap(),

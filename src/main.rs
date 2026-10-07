@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use celso::checker::{Checker, Config, EditKind, Finding, load_inflections, load_readings};
-use celso::lm::{self, BuildConfig, MAX_ORDER, Model};
+use celso::lm::{self, BuildConfig, MAX_ORDER};
 use celso::norm::norm;
 use celso::synth::{Rng, corrupt};
 use celso::tokenize::Tokenizer;
@@ -28,8 +28,22 @@ enum Cmd {
         #[arg(short, long, default_value = "data/ipadic.dic")]
         output: PathBuf,
     },
+    /// 分かち書き済みコーパスの語の出現数を数え、上位 n 語を語彙ファイルとして出力する。
+    Vocab {
+        #[arg(long, default_value_t = 50_000)]
+        size: usize,
+        #[arg(short, long)]
+        output: PathBuf,
+        inputs: Vec<PathBuf>,
+    },
     /// 1 行 1 文のコーパス (stdin) を分かち書きして stdout へ。活用表も集める。
     Tokenize {
+        /// 語彙ファイル。ここに無い語は品詞クラス (<名詞-固有名詞> など) に置き換える
+        #[arg(long)]
+        vocab: Option<PathBuf>,
+        /// 各トークンを「表層形\x1f品詞クラス」で出す (build-lm --vocab で後から語彙を選べる)
+        #[arg(long)]
+        with_class: bool,
         #[arg(long)]
         inflections: Option<PathBuf>,
         /// 同音異字表 (読み \t 表層形 \t 出現数) の出力先
@@ -40,6 +54,9 @@ enum Cmd {
     BuildLm {
         #[arg(long, default_value_t = 4)]
         order: usize,
+        /// 語彙ファイル (--with-class で分かち書きしたコーパス用)。語彙外の語は品詞クラスにする
+        #[arg(long)]
+        vocab: Option<PathBuf>,
         #[arg(long, default_value_t = 2)]
         min_word_count: u32,
         /// 次数ごとの足切り (カンマ区切り, 1-gram から)
@@ -55,8 +72,20 @@ enum Cmd {
         m: ModelArgs,
         file: PathBuf,
     },
-    /// 旧形式 (CELSOLM2) のモデルを配布形式 (CELSOLM3: 量子化・mmap 可) に変換する。
-    Convert { input: PathBuf, output: PathBuf },
+    /// 軽量版 (n-gram の有無だけ) のモデルを作る。
+    BuildSet {
+        #[arg(long, default_value_t = 3)]
+        order: usize,
+        #[arg(long)]
+        vocab: Option<PathBuf>,
+        #[arg(long, default_value_t = 2)]
+        min_word_count: u32,
+        #[arg(long, default_value = "1,2,2,2,2")]
+        min_count: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        inputs: Vec<PathBuf>,
+    },
     /// テキストを検査する (ファイル省略時は stdin)。
     Check {
         #[command(flatten)]
@@ -191,7 +220,7 @@ impl ModelArgs {
 
     fn load(&self) -> Result<Checker> {
         let t = Instant::now();
-        let lm = Model::load(&self.model)?;
+        let lm = lm::load_any(&self.model)?;
         let infl = load_inflections(&self.inflections)?;
         let readings = if self.readings.exists() {
             load_readings(&self.readings)?
@@ -201,7 +230,7 @@ impl ModelArgs {
         eprintln!(
             "model loaded in {:.2?} (order {}, vocab {})",
             t.elapsed(),
-            lm.order,
+            lm.order(),
             lm.vocab_len()
         );
         let checker = Checker::new(Tokenizer::new()?, lm, self.config(), infl, readings);
@@ -258,22 +287,72 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Convert { input, output } => {
-            Model::load(&input)?.save(&output)?;
-            eprintln!("wrote {output:?}");
-            Ok(())
-        }
         Cmd::BuildDict { raw_dir, output } => {
             celso::tokenize::build_dict(&raw_dir, &output)?;
             eprintln!("wrote {output:?}");
             Ok(())
         }
+        Cmd::BuildSet {
+            order,
+            vocab,
+            min_word_count,
+            min_count,
+            output,
+            inputs,
+        } => {
+            let mut mc = [1u32; MAX_ORDER];
+            for (i, v) in min_count.split(',').enumerate().take(MAX_ORDER) {
+                mc[i] = v.parse()?;
+            }
+            let vocab: Option<rustc_hash::FxHashSet<String>> = match vocab {
+                Some(p) => Some(
+                    std::fs::read_to_string(p)?
+                        .lines()
+                        .map(String::from)
+                        .collect(),
+                ),
+                None => None,
+            };
+            let t = Instant::now();
+            let s = celso::ngset::build(&inputs, order, min_word_count, mc, vocab.as_ref())?;
+            s.save(&output)?;
+            eprintln!("built in {:.1?}", t.elapsed());
+            Ok(())
+        }
+        Cmd::Vocab {
+            size,
+            output,
+            inputs,
+        } => {
+            let mut wc: FxHashMap<String, u64> = FxHashMap::default();
+            for p in inputs {
+                for line in std::io::BufReader::new(std::fs::File::open(p)?).lines() {
+                    for w in line?
+                        .split(' ')
+                        .filter(|w| !w.is_empty() && !w.starts_with('<'))
+                    {
+                        let w = w.split('\x1f').next().unwrap_or(w);
+                        *wc.entry(w.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            let mut v: Vec<(String, u64)> = wc.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let mut w = BufWriter::new(std::fs::File::create(&output)?);
+            for (word, _) in v.into_iter().take(size) {
+                writeln!(w, "{word}")?;
+            }
+            Ok(())
+        }
         Cmd::Tokenize {
+            vocab,
+            with_class,
             inflections,
             readings,
-        } => tokenize_cmd(inflections, readings),
+        } => tokenize_cmd(vocab, with_class, inflections, readings),
         Cmd::BuildLm {
             order,
+            vocab,
             min_word_count,
             min_count,
             output,
@@ -284,12 +363,22 @@ fn main() -> Result<()> {
                 mc[i] = v.parse()?;
             }
             let t = Instant::now();
+            let vocab = match vocab {
+                Some(p) => Some(
+                    std::fs::read_to_string(p)?
+                        .lines()
+                        .map(String::from)
+                        .collect(),
+                ),
+                None => None,
+            };
             let m = lm::build(
                 &inputs,
                 &BuildConfig {
                     order,
                     min_word_count,
                     min_count: mc,
+                    vocab,
                 },
             )?;
             m.save(&output)?;
@@ -369,7 +458,21 @@ fn context(text: &str, f: &Finding) -> String {
     format!("{s}[{m}]{e}").replace('\n', " ")
 }
 
-fn tokenize_cmd(inflections: Option<PathBuf>, readings: Option<PathBuf>) -> Result<()> {
+fn tokenize_cmd(
+    vocab: Option<PathBuf>,
+    with_class: bool,
+    inflections: Option<PathBuf>,
+    readings: Option<PathBuf>,
+) -> Result<()> {
+    let vocab: Option<rustc_hash::FxHashSet<String>> = match vocab {
+        Some(p) => Some(
+            std::fs::read_to_string(p)?
+                .lines()
+                .map(String::from)
+                .collect(),
+        ),
+        None => None,
+    };
     let mut reading_counts: FxHashMap<(String, String), u32> = FxHashMap::default();
     let tok = Tokenizer::new()?;
     let stdin = std::io::stdin();
@@ -398,7 +501,16 @@ fn tokenize_cmd(inflections: Option<PathBuf>, readings: Option<PathBuf>) -> Resu
                         if !s.is_empty() {
                             s.push(' ');
                         }
-                        s.push_str(t.key());
+                        match &vocab {
+                            Some(v) if !t.is_num() && !v.contains(t.surface.as_str()) => {
+                                s.push_str(&t.class_key())
+                            }
+                            _ => s.push_str(t.key()),
+                        }
+                        if with_class && !t.is_num() {
+                            s.push('\x1f');
+                            s.push_str(&t.class_key());
+                        }
                         if matches!(t.pos.as_str(), "動詞" | "形容詞" | "助動詞")
                             && !t.conj_type.is_empty()
                         {

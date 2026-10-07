@@ -24,7 +24,7 @@ pub const BOS: u32 = 2;
 pub const EOS: u32 = 3;
 
 #[inline]
-fn pack(ids: &[u32]) -> u128 {
+pub(crate) fn pack(ids: &[u32]) -> u128 {
     let mut k: u128 = 0;
     for &id in ids {
         k = (k << ID_BITS) | id as u128;
@@ -42,55 +42,67 @@ fn strip_order(key: u128) -> u128 {
     key & !(0xFu128 << 124)
 }
 
-/// ハッシュ表の 1 枠。キーは n-gram (u128) の 64bit 指紋で持つ (0 は空き)。
-/// 4,800 万 n-gram 規模でも指紋の衝突で別の n-gram を誤って引く確率は無視できる。
+/// 構築時のハッシュ表の 1 枠。`h` は n-gram (u128) の 64bit ハッシュ (0 は空き)。
+/// 位置は `h` の上位ビット ([`slot_index`])、配布形式の指紋は `h` の下位ビットから取る。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Slot {
-    key: u64,
+    h: u64,
     logp: f32,
     bow: f32,
 }
 
 #[inline]
-fn fingerprint(key: u128) -> u64 {
+pub(crate) fn key_hash(key: u128) -> u64 {
     let lo = key as u64;
     let hi = (key >> 64) as u64;
     let mut h = hi ^ lo.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29);
     h ^= h >> 31;
     h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
     h ^= h >> 29;
+    h = h.wrapping_add(lo.rotate_left(17) ^ hi);
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= h >> 32;
     h | 1
 }
 
-/// 配布用の量子化済み 1 枠 (8 バイト)。キーは 32bit 指紋、確率と backoff は 16bit 固定小数。
+/// 容量を 2 のべき乗に揃えずに済むよう、`h * cap` の上位 64 bit を位置にする (fastrange)。
+#[inline]
+fn slot_index(h: u64, cap: usize) -> usize {
+    ((u128::from(h) * cap as u128) >> 64) as usize
+}
+
+/// 配布用の 1 枠 (4 バイト): 16bit 指紋 + 8bit 確率 + 8bit backoff。
 ///
-/// 構築時の [`Slot`] (16 バイト) と同じ位置に同じ順で並べるので、線形探索の到達順も変わらない。
-/// 32bit 指紋の取り違え確率は 1 回の探索あたり 1e-9 程度で、結果への影響は無視できる。
+/// 構築時の [`Slot`] と同じ位置に並べるので、線形探索の到達順も変わらない。
+/// 指紋の取り違えは 1 回の探索あたり数万分の 1 程度で、未出現の並びをまれに「見たことがある」と
+/// 誤るだけ (誤検出が減る方向) なので許容する。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct QSlot {
-    key: u32,
-    logp: u16,
-    bow: u16,
-}
-
-/// 量子化の範囲: log10 で [-QRANGE, 0]。確率は構築時に 1e-12 で下限を切っているので収まる。
-const QRANGE: f32 = 16.0;
-
-#[inline]
-fn quantize(v: f32) -> u16 {
-    ((-v).clamp(0.0, QRANGE) / QRANGE * 65535.0).round() as u16
+    fp: u16,
+    logp: u8,
+    bow: u8,
 }
 
 #[inline]
-fn dequantize(q: u16) -> f32 {
-    -(q as f32) * (QRANGE / 65535.0)
+fn fp16(h: u64) -> u16 {
+    (((h >> 1) & 0xFFFF) as u16).max(1)
+}
+
+/// 量子化の範囲: log10 で [-QRANGE, 0] を 8bit (1 段 0.047) で表す。
+/// 確率は構築時に 1e-12 で下限を切っているので収まる。Δ の閾値 (2〜4) に比べて誤差は十分小さい。
+const QRANGE: f32 = 12.0;
+
+#[inline]
+fn quantize(v: f32) -> u8 {
+    ((-v).clamp(0.0, QRANGE) / QRANGE * 255.0).round() as u8
 }
 
 #[inline]
-fn fingerprint32(key: u128) -> u32 {
-    ((fingerprint(key) >> 32) as u32) | 1
+fn dequantize(q: u8) -> f32 {
+    -f32::from(q) * (QRANGE / 255.0)
 }
 
 enum Table {
@@ -116,14 +128,65 @@ impl Table {
     fn qslots(&self) -> &[QSlot] {
         match self {
             Table::Mapped { map, offset, len } => {
-                // SAFETY: offset は 8 バイト境界に揃えて書き出しており、mmap の先頭はページ境界。
+                // SAFETY: offset は 4 バイト境界に揃えて書き出しており、mmap の先頭はページ境界。
                 // QSlot は repr(C) の POD で、ファイルは読み取り専用で開いている。
                 unsafe {
-                    std::slice::from_raw_parts(map.as_ptr().add(*offset) as *const QSlot, *len)
+                    std::slice::from_raw_parts(map.as_ptr().add(*offset).cast::<QSlot>(), *len)
                 }
             }
             Table::Build(_) => &[],
         }
+    }
+}
+
+/// チェッカーから見た言語モデル。確率モデル ([`Model`]) と、n-gram の有無だけを持つ
+/// 軽量版 ([`crate::ngset::NgramSet`]) を差し替えられるようにする。
+pub trait LanguageModel: Send + Sync {
+    fn order(&self) -> usize;
+    fn word_id(&self, w: &str) -> u32;
+    /// log10 P(w | ctx) (軽量版では n-gram の有無から作る擬似スコア)
+    fn logp(&self, ctx: &[u32], w: u32) -> f32;
+    /// (ctx, w) について、実在する最長の n-gram の次数。0 は語彙外。
+    fn match_order(&self, ctx: &[u32], w: u32) -> usize;
+    fn vocab_len(&self) -> usize;
+
+    /// トークンの語 ID。語彙に無ければ品詞クラスの ID (学習時に語彙外を品詞クラスへ置き換えている)。
+    fn token_id(&self, t: &crate::tokenize::Token) -> u32 {
+        let id = self.word_id(t.key());
+        if id != UNK {
+            id
+        } else {
+            self.word_id(&t.class_key())
+        }
+    }
+}
+
+impl LanguageModel for Model {
+    fn order(&self) -> usize {
+        self.order
+    }
+    fn word_id(&self, w: &str) -> u32 {
+        Model::word_id(self, w)
+    }
+    fn logp(&self, ctx: &[u32], w: u32) -> f32 {
+        Model::logp(self, ctx, w)
+    }
+    fn match_order(&self, ctx: &[u32], w: u32) -> usize {
+        Model::match_order(self, ctx, w)
+    }
+    fn vocab_len(&self) -> usize {
+        Model::vocab_len(self)
+    }
+}
+
+/// ファイル先頭の識別子を見て、確率モデルか軽量版かを開く。
+pub fn load_any(path: &Path) -> Result<Box<dyn LanguageModel>> {
+    let mut magic = [0u8; 8];
+    std::io::Read::read_exact(&mut File::open(path)?, &mut magic)?;
+    if &magic == b"CELSONS1" {
+        Ok(Box::new(crate::ngset::NgramSet::load(path)?))
+    } else {
+        Ok(Box::new(Model::load(path)?))
     }
 }
 
@@ -132,18 +195,7 @@ pub struct Model {
     pub order: usize,
     vocab: FxHashMap<String, u32>,
     table: Table,
-    mask: usize,
-}
-
-#[inline]
-fn hash(key: u128) -> u64 {
-    let lo = key as u64;
-    let hi = (key >> 64) as u64;
-    let mut h = lo ^ hi.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h
+    cap: usize,
 }
 
 impl Model {
@@ -158,31 +210,38 @@ impl Model {
     /// n-gram の (log10 確率, log10 backoff) を引く。
     #[inline]
     fn get(&self, key: u128) -> Option<(f32, f32)> {
-        let mut i = hash(key) as usize & self.mask;
+        let h = key_hash(key);
+        let cap = self.cap;
+        let mut i = slot_index(h, cap);
         if let Table::Build(slots) = &self.table {
-            let fp = fingerprint(key);
             loop {
                 let s = &slots[i];
-                if s.key == fp {
+                if s.h == h {
                     return Some((s.logp, s.bow));
                 }
-                if s.key == 0 {
+                if s.h == 0 {
                     return None;
                 }
-                i = (i + 1) & self.mask;
+                i += 1;
+                if i == cap {
+                    i = 0;
+                }
             }
         }
         let slots = self.table.qslots();
-        let fp = fingerprint32(key);
+        let fp = fp16(h);
         loop {
             let s = &slots[i];
-            if s.key == fp {
+            if s.fp == fp {
                 return Some((dequantize(s.logp), dequantize(s.bow)));
             }
-            if s.key == 0 {
+            if s.fp == 0 {
                 return None;
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == cap {
+                i = 0;
+            }
         }
     }
 
@@ -223,7 +282,7 @@ impl Model {
         0
     }
 
-    /// 配布形式 (CELSOLM3: 量子化済み) で保存する。
+    /// 配布形式 (CELSOLM4: 1 枠 4 バイト) で保存する。
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         let pos = std::cell::Cell::new(0usize);
@@ -232,7 +291,7 @@ impl Model {
             pos.set(pos.get() + b.len());
             Ok(())
         };
-        put(&mut w, b"CELSOLM3")?;
+        put(&mut w, b"CELSOLM4")?;
         put(&mut w, &(self.order as u32).to_le_bytes())?;
         let mut words: Vec<(&String, &u32)> = self.vocab.iter().collect();
         words.sort_by_key(|(_, id)| **id);
@@ -243,20 +302,20 @@ impl Model {
             put(&mut w, word.as_bytes())?;
         }
         put(&mut w, &(self.table.len() as u64).to_le_bytes())?;
-        // 表本体を 8 バイト境界に揃える (mmap してそのまま &[QSlot] として読むため)
-        let pad = (8 - pos.get() % 8) % 8;
-        put(&mut w, &[0u8; 8][..pad])?;
+        // 表本体を 4 バイト境界に揃える (mmap してそのまま &[QSlot] として読むため)
+        let pad = (4 - pos.get() % 4) % 4;
+        put(&mut w, &[0u8; 4][..pad])?;
         let q: Vec<QSlot>;
         let slots: &[QSlot] = match &self.table {
             Table::Build(v) => {
                 q = v
                     .iter()
                     .map(|s| {
-                        if s.key == 0 {
+                        if s.h == 0 {
                             QSlot::default()
                         } else {
                             QSlot {
-                                key: ((s.key >> 32) as u32) | 1,
+                                fp: fp16(s.h),
                                 logp: quantize(s.logp),
                                 bow: quantize(s.bow),
                             }
@@ -265,18 +324,18 @@ impl Model {
                     .collect();
                 &q
             }
-            _ => self.table.qslots(),
+            Table::Mapped { .. } => self.table.qslots(),
         };
         // SAFETY: QSlot は repr(C) の POD
         let bytes =
-            unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, size_of_val(slots)) };
+            unsafe { std::slice::from_raw_parts(slots.as_ptr().cast::<u8>(), size_of_val(slots)) };
         put(&mut w, bytes)?;
         Ok(())
     }
 
-    /// CELSOLM3 は mmap で開く (読み込みはほぼ一瞬)。旧形式の CELSOLM2 は変換用にメモリへ読む。
+    /// 配布形式 (CELSOLM4) を mmap で開く (読み込みはほぼ一瞬)。
     pub fn load(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("{path:?}"))?;
+        let file = File::open(path).with_context(|| format!("{}", path.display()))?;
         // SAFETY: 読み取り専用で開いたモデルファイルを mmap する。実行中に書き換えないこと。
         let map = unsafe { memmap2::Mmap::map(&file)? };
         let pos = std::cell::Cell::new(0usize);
@@ -289,12 +348,9 @@ impl Model {
             pos.set(p + n);
             Ok(&bytes[p..p + n])
         };
-        let magic = take(8)?.to_vec();
-        let v3 = match &magic[..] {
-            b"CELSOLM3" => true,
-            b"CELSOLM2" => false,
-            _ => bail!("not a celso model"),
-        };
+        if take(8)? != b"CELSOLM4" {
+            bail!("not a celso model (CELSOLM4)");
+        }
         let order = u32::from_le_bytes(take(4)?.try_into()?) as usize;
         let nwords = u32::from_le_bytes(take(4)?.try_into()?) as usize;
         let mut vocab = FxHashMap::default();
@@ -306,34 +362,19 @@ impl Model {
         }
         let nslots = u64::from_le_bytes(take(8)?.try_into()?) as usize;
         let consumed = pos.get();
-        let table = if v3 {
-            let offset = consumed + (8 - consumed % 8) % 8;
-            if offset + nslots * size_of::<QSlot>() > map.len() {
-                bail!("truncated model file");
-            }
-            Table::Mapped {
-                map,
-                offset,
-                len: nslots,
-            }
-        } else {
-            let bytes = take(nslots * size_of::<Slot>())?;
-            let mut slots = vec![Slot::default(); nslots];
-            // SAFETY: Slot は repr(C) の POD。バイト列からコピーする。
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    slots.as_mut_ptr() as *mut u8,
-                    bytes.len(),
-                );
-            }
-            Table::Build(slots)
-        };
+        let offset = consumed + (4 - consumed % 4) % 4;
+        if offset + nslots * size_of::<QSlot>() > map.len() {
+            bail!("truncated model file");
+        }
         Ok(Self {
             order,
             vocab,
-            table,
-            mask: nslots - 1,
+            table: Table::Mapped {
+                map,
+                offset,
+                len: nslots,
+            },
+            cap: nslots,
         })
     }
 }
@@ -345,6 +386,19 @@ pub struct BuildConfig {
     pub min_word_count: u32,
     /// 次数ごとの足切り (index = 次数-1)。生の出現回数がこれ未満の n-gram はモデルに入れない。
     pub min_count: [u32; MAX_ORDER],
+    /// 語彙。コーパスのトークンが「表層形\x1f品詞クラス」のとき、語彙外の表層形は品詞クラスにする。
+    pub vocab: Option<rustc_hash::FxHashSet<String>>,
+}
+
+/// コーパスの 1 トークンを、語彙に応じて表層形か品詞クラスにする。
+pub(crate) fn corpus_key<'a>(w: &'a str, vocab: Option<&rustc_hash::FxHashSet<String>>) -> &'a str {
+    match w.split_once('\x1f') {
+        Some((surface, class)) => match vocab {
+            Some(v) if !v.contains(surface) => class,
+            _ => surface,
+        },
+        None => w,
+    }
 }
 
 /// 分かち書き済みファイル (1 行 1 文, 空白区切り) からモデルを作る。
@@ -355,6 +409,7 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
     for p in paths {
         for line in BufReader::new(File::open(p.as_ref())?).lines() {
             for w in line?.split(' ').filter(|w| !w.is_empty()) {
+                let w = corpus_key(w, cfg.vocab.as_ref());
                 if let Some(c) = wc.get_mut(w) {
                     *c += 1;
                 } else {
@@ -387,6 +442,7 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
             let line = line?;
             corpus.push(BOS);
             for w in line.split(' ').filter(|w| !w.is_empty()) {
+                let w = corpus_key(w, cfg.vocab.as_ref());
                 corpus.push(vocab.get(w).copied().unwrap_or(UNK));
             }
             corpus.push(EOS);
@@ -502,13 +558,13 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
         order: cfg.order,
         vocab,
         table: Table::Build(Vec::new()),
-        mask: 0,
+        cap: 0,
     };
     let total: usize = keep.iter().map(|k| k.iter().filter(|b| **b).count()).sum();
-    // 線形探索で充填率 75% 程度までは問い合わせ速度がほぼ落ちない
-    let cap = (total + total / 8).next_power_of_two().max(1024);
+    // 充填率 80%。表は小さい (キャッシュに乗りやすい) ので、線形探索が多少伸びても速度はほぼ落ちない
+    let cap = (total * 5 / 4).max(1024);
     model.table = Table::Build(vec![Slot::default(); cap]);
-    model.mask = cap - 1;
+    model.cap = cap;
     eprintln!("kept n-grams: {total}, slots: {cap}");
 
     let vocab_size = model.vocab.len() as f64;
@@ -594,33 +650,39 @@ impl Model {
         let Table::Build(slots) = &self.table else {
             return None;
         };
-        let fp = fingerprint(key);
-        let mut i = hash(key) as usize & self.mask;
+        let h = key_hash(key);
+        let mut i = slot_index(h, self.cap);
         loop {
             let s = &slots[i];
-            if s.key == fp {
+            if s.h == h {
                 return Some(i);
             }
-            if s.key == 0 {
+            if s.h == 0 {
                 return None;
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.cap {
+                i = 0;
+            }
         }
     }
 
     fn insert(&mut self, key: u128, logp: f32) {
-        let fp = fingerprint(key);
-        let mask = self.mask;
+        let h = key_hash(key);
+        let cap = self.cap;
         let slots = self.build_slots_mut();
-        let mut i = hash(key) as usize & mask;
+        let mut i = slot_index(h, cap);
         loop {
             let s = &mut slots[i];
-            if s.key == 0 || s.key == fp {
-                s.key = fp;
+            if s.h == 0 || s.h == h {
+                s.h = h;
                 s.logp = logp;
                 return;
             }
-            i = (i + 1) & mask;
+            i += 1;
+            if i == cap {
+                i = 0;
+            }
         }
     }
 }
@@ -661,7 +723,7 @@ mod tests {
             (vec![BOS, id("宿泊")], id("施設")),
             (vec![id("駅"), id("から")], id("施設")),
         ] {
-            assert!((m.logp(&ctx, w) - q.logp(&ctx, w)).abs() < 1e-3);
+            assert!((m.logp(&ctx, w) - q.logp(&ctx, w)).abs() < 0.1);
         }
     }
 }

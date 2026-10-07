@@ -56,6 +56,16 @@ impl Token {
                 .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
     }
 
+    /// 語彙外の語の代わりに使う品詞クラス。活用語は活用形まで含める
+    /// (「<動詞-自立-連用形>」)。助詞・活用の誤りを見るのに、内容語の表層形までは要らない。
+    pub fn class_key(&self) -> String {
+        if self.conj_form.is_empty() {
+            format!("<{}-{}>", self.pos, self.pos1)
+        } else {
+            format!("<{}-{}-{}>", self.pos, self.pos1, self.conj_form)
+        }
+    }
+
     pub fn key(&self) -> &str {
         if self.is_num() {
             NUM_KEY
