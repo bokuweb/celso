@@ -368,14 +368,15 @@ impl Model {
         let header = parse_header(bytes)?;
         let raw = &bytes[header.offset..header.offset + header.nslots * size_of::<QSlot>()];
         // QSlot は repr(C) で fp (u16 LE)・logp・bow の順に 4 バイト。保存時と同じく little endian で読む
-        let slots: Vec<QSlot> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| QSlot {
-                fp: u16::from_le_bytes([c[0], c[1]]),
-                logp: c[2],
-                bow: c[3],
+        // (elsa の crate の MSRV 1.85 では as_chunks が使えないので、添字で 4 バイトずつ読む)
+        let slots: Vec<QSlot> = (0..header.nslots)
+            .map(|i| {
+                let c = &raw[i * 4..i * 4 + 4];
+                QSlot {
+                    fp: u16::from_le_bytes([c[0], c[1]]),
+                    logp: c[2],
+                    bow: c[3],
+                }
             })
             .collect();
         Ok(Self {
