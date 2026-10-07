@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
-use celso::checker::{Checker, Config, EditKind, Finding, load_inflections, load_readings};
+use anyhow::{Result, bail};
+use celso::checker::{Checker, Config, Domain, EditKind, Finding, load_inflections, load_readings};
 use celso::lm::{self, BuildConfig, MAX_ORDER};
 use celso::norm::norm;
 use celso::synth::{Rng, corrupt};
@@ -117,6 +117,51 @@ enum Cmd {
         weight_by_count: bool,
         inputs: Vec<PathBuf>,
     },
+    /// 誤字パターンの候補 (誤り \t 正しい \t ...) の、コーパスでの出現数を数えて列に足す。
+    CountPatterns {
+        /// scripts/patterns/extract.py の出力
+        candidates: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// 数えるコーパス (1 行 1 文のテキスト)
+        inputs: Vec<PathBuf>,
+    },
+    /// 判定器の学習データを書き出す (候補ごとの特徴量と正解ラベル)。
+    ///
+    /// --synth は「ファイル:文書種類:種類ごとの件数」(人工誤り + 誤りのない文)、--jwtd は実際の誤字。
+    DumpRerank {
+        #[command(flatten)]
+        m: ModelArgs,
+        #[arg(long)]
+        synth: Vec<String>,
+        #[arg(long)]
+        jwtd: Option<PathBuf>,
+        #[arg(long, default_value_t = 20_000)]
+        jwtd_limit: usize,
+        /// この n-gram Δ 以上の候補を書き出す
+        #[arg(long, default_value_t = 1.0)]
+        floor: f32,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// 判定器を学習する (dump-rerank の出力から)。
+    TrainRerank {
+        inputs: Vec<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        epochs: usize,
+        #[arg(long, default_value_t = 0.2)]
+        lr: f32,
+        #[arg(long, default_value_t = 1e-5)]
+        l2: f32,
+        #[arg(long, default_value_t = 3)]
+        min_count: usize,
+        #[arg(long, default_value_t = 1.0)]
+        floor: f32,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// 活用表・同音異字表を、モデルの語彙にある語だけへ絞って書き出す (配布用)。
     PruneTables {
         #[command(flatten)]
@@ -197,6 +242,27 @@ struct ModelArgs {
     cooc: PathBuf,
     #[arg(long, default_value_t = 1.0)]
     cooc_weight: f32,
+    /// 文法モデル (機能語 + 品詞クラスの 5-gram)。判定器の特徴量に使う。無ければ使わない
+    #[arg(long, default_value = "data/func.bin")]
+    aux_model: PathBuf,
+    /// 助詞の削除・置換・補いの Δ に足す文法モデルの重み
+    #[arg(long, default_value_t = 0.0)]
+    aux_weight: f32,
+    /// 実際の誤字から集めた書き換えパターン (scripts/patterns/)。無ければ使わない
+    #[arg(long, default_value = "data/patterns.tsv")]
+    patterns: PathBuf,
+    /// 採否の判定器 (train-rerank の出力)。無ければ種類ごとの閾値で決める
+    #[arg(long, default_value = "data/rerank.tsv")]
+    rerank: PathBuf,
+    /// 判定器の閾値 (法令文,一般文,契約書 の対数オッズ)。省略時はファイルの値
+    #[arg(long)]
+    rerank_tau: Option<String>,
+    /// 種類ごとの判定器の閾値「delete=-1.5,-1.4,0.5;…」(省略時はファイルの値)
+    #[arg(long)]
+    rerank_tau_kind: Option<String>,
+    /// 判定器を使わない種類 (カンマ区切り。省略時はファイルの値)
+    #[arg(long)]
+    rerank_exempt: Option<String>,
     /// 最終スコア = n-gram Δ + mlm_weight × MLM Δ
     #[arg(long, default_value_t = 1.0)]
     mlm_weight: f32,
@@ -264,6 +330,7 @@ impl ModelArgs {
         };
         cfg.mlm_weight = self.mlm_weight;
         cfg.cooc_weight = self.cooc_weight;
+        cfg.aux_weight = self.aux_weight;
         cfg.stage1_slack = self.stage1_slack;
         cfg.mlm_length_penalty = self.length_penalty;
         cfg.mlm_band = self.mlm_band;
@@ -293,6 +360,47 @@ impl ModelArgs {
         let checker = Checker::new(Tokenizer::new()?, lm, self.config(), infl, readings);
         let checker = if self.cooc.exists() {
             checker.with_cooc(celso::cooc::Cooc::load(&self.cooc)?)
+        } else {
+            checker
+        };
+        let checker = if self.aux_model.exists() {
+            checker.with_aux(lm::load_any(&self.aux_model)?)
+        } else {
+            checker
+        };
+        let checker = if self.patterns.exists() {
+            checker.with_patterns(celso::patterns::Patterns::load(&self.patterns)?)
+        } else {
+            checker
+        };
+        let checker = if self.rerank.exists() {
+            let mut r = celso::rerank::Reranker::load(&self.rerank)?;
+            if let Some(t) = &self.rerank_tau {
+                for (i, x) in t.split(',').enumerate().take(3) {
+                    r.tau[i] = x.trim().parse()?;
+                }
+            }
+            // 種類ごとの上書き「種類=法令文,一般文,契約書;…」
+            if let Some(t) = &self.rerank_tau_kind {
+                for spec in t.split(';').filter(|x| !x.is_empty()) {
+                    let (k, v) = spec
+                        .split_once('=')
+                        .ok_or_else(|| anyhow::anyhow!("--rerank-tau-kind は 種類=a,b,c"))?;
+                    let mut a = r.tau;
+                    for (i, x) in v.split(',').enumerate().take(3) {
+                        a[i] = x.trim().parse()?;
+                    }
+                    r.tau_kind.insert(k.to_string(), a);
+                }
+            }
+            if let Some(e) = &self.rerank_exempt {
+                r.exempt = e
+                    .split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
+            checker.with_rerank(r)
         } else {
             checker
         };
@@ -378,6 +486,99 @@ fn main() -> Result<()> {
             let c = st.select_pmi(top_k, min_pair, weight_by_count)?;
             c.save(&output)?;
             eprintln!("built in {:.1?}", t.elapsed());
+            Ok(())
+        }
+        Cmd::CountPatterns {
+            candidates,
+            output,
+            inputs,
+        } => {
+            use std::io::{BufRead, BufWriter, Write};
+            let rows: Vec<Vec<String>> = std::fs::read_to_string(&candidates)?
+                .lines()
+                .map(|l| l.split('\t').map(String::from).collect())
+                .filter(|r: &Vec<String>| r.len() >= 2)
+                .collect();
+            // 誤り側・正しい側の文字列をまとめて 1 つのオートマトンにする (重複は 1 つに)
+            let mut index: rustc_hash::FxHashMap<&str, usize> = Default::default();
+            let mut pats: Vec<&str> = Vec::new();
+            for r in &rows {
+                for s in [&r[0], &r[1]] {
+                    index.entry(s.as_str()).or_insert_with(|| {
+                        pats.push(s.as_str());
+                        pats.len() - 1
+                    });
+                }
+            }
+            let ac = aho_corasick::AhoCorasick::new(&pats)?;
+            let mut counts = vec![0u64; pats.len()];
+            let t = Instant::now();
+            for p in &inputs {
+                for line in std::io::BufReader::new(std::fs::File::open(p)?).lines() {
+                    let line = celso::norm::norm(&line?);
+                    for m in ac.find_overlapping_iter(&line) {
+                        counts[m.pattern().as_usize()] += 1;
+                    }
+                }
+                eprintln!("{}: done ({:.1?})", p.display(), t.elapsed());
+            }
+            let mut w = BufWriter::new(std::fs::File::create(&output)?);
+            for r in &rows {
+                writeln!(
+                    w,
+                    "{}\t{}\t{}",
+                    r.join("\t"),
+                    counts[index[r[0].as_str()]],
+                    counts[index[r[1].as_str()]]
+                )?;
+            }
+            Ok(())
+        }
+        Cmd::DumpRerank {
+            m,
+            synth,
+            jwtd,
+            jwtd_limit,
+            floor,
+            seed,
+            output,
+        } => dump_rerank(m, &synth, jwtd.as_deref(), jwtd_limit, floor, seed, &output),
+        Cmd::TrainRerank {
+            inputs,
+            epochs,
+            lr,
+            l2,
+            min_count,
+            floor,
+            output,
+        } => {
+            let mut data = Vec::new();
+            for p in &inputs {
+                for line in std::fs::read_to_string(p)?.lines() {
+                    let mut it = line.split('\t');
+                    let (Some(label), Some(weight), Some(_group)) =
+                        (it.next(), it.next(), it.next())
+                    else {
+                        continue;
+                    };
+                    let feats = it
+                        .filter_map(|x| x.split_once('\x1f'))
+                        .filter_map(|(k, v)| v.parse().ok().map(|v| (k.to_string(), v)))
+                        .collect();
+                    data.push(celso::rerank::Example {
+                        label: label == "1",
+                        weight: weight.parse().unwrap_or(1.0),
+                        feats,
+                    });
+                }
+            }
+            let pos = data.iter().filter(|e| e.label).count();
+            eprintln!("{} examples ({} positive)", data.len(), pos);
+            let w = celso::rerank::train(&data, epochs, lr, l2, min_count);
+            eprintln!("{} weights", w.len());
+            let mut r = celso::rerank::Reranker::new(w);
+            r.floor = floor;
+            r.save(&output)?;
             Ok(())
         }
         Cmd::PruneTables { m, out_dir } => {
@@ -842,7 +1043,7 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
                 .map(|k| format!("{:<10} rec/cor/fp10k", k.label()))
                 .join(" | ")
         );
-        for ti in 0..=12 {
+        for ti in 0..=30 {
             let tau = ti as f32 * 0.5;
             let mut row = format!("{tau:<5.1} |");
             for k in kinds {
@@ -973,6 +1174,130 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
                 shown += 1;
             }
         }
+    }
+    Ok(())
+}
+
+/// 判定器の学習データを書き出す。1 行 1 候補で「ラベル \t 重み \t グループ \t 特徴量…」
+/// (特徴量は「名前 \x1f 値」)。グループは同じ文の候補をまとめる番号。
+#[allow(clippy::too_many_arguments)]
+fn dump_rerank(
+    m: ModelArgs,
+    synth: &[String],
+    jwtd: Option<&Path>,
+    jwtd_limit: usize,
+    floor: f32,
+    seed: u64,
+    output: &Path,
+) -> Result<()> {
+    use std::io::Write;
+    let checker = m.load()?;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(output)?);
+    let mut group = 0usize;
+    let mut write = |w: &mut std::io::BufWriter<std::fs::File>,
+                     text: &str,
+                     gold: Option<&str>,
+                     d: Domain|
+     -> Result<(usize, usize)> {
+        group += 1;
+        let (mut np, mut nn) = (0, 0);
+        for (f, x) in checker.candidate_features(text, d, floor) {
+            let label = gold.is_some_and(|g| apply(text, &f) == g);
+            if label {
+                np += 1;
+            } else {
+                nn += 1;
+            }
+            let feats: Vec<String> = x.iter().map(|(k, v)| format!("{k}\x1f{v}")).collect();
+            writeln!(w, "{}\t1\t{group}\t{}", u8::from(label), feats.join("\t"))?;
+        }
+        Ok((np, nn))
+    };
+    let readings = {
+        let lm = checker.lm.as_ref();
+        load_readings(&m.readings, &|x: &str| lm.word_id(x) != celso::lm::UNK)?
+    };
+    let infl = load_inflections(&m.inflections, &|_| true)?;
+    for spec in synth {
+        let mut parts = spec.rsplitn(3, ':');
+        let (Some(n), Some(dom), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            bail!("--synth はファイル:文書種類:件数");
+        };
+        let n: usize = n.parse()?;
+        let d = match dom {
+            "legal" => Domain::Legal,
+            "contract" => Domain::Contract,
+            _ => Domain::General,
+        };
+        let text = std::fs::read_to_string(path)?;
+        let mut sents: Vec<String> = Vec::new();
+        for line in text.lines() {
+            for s in norm(line).split_inclusive('。') {
+                let s = s.trim();
+                if s.chars().count() >= 12 && s.chars().any(|c| ('ぁ'..='ん').contains(&c)) {
+                    sents.push(s.to_string());
+                }
+            }
+        }
+        let mut rng = Rng::new(seed);
+        let (mut np, mut nn) = (0, 0);
+        for k in [
+            EditKind::Delete,
+            EditKind::Substitute,
+            EditKind::Inflection,
+            EditKind::Insert,
+            EditKind::Homophone,
+        ] {
+            let mut made = 0;
+            let mut tries = 0;
+            while made < n && tries < n * 20 {
+                tries += 1;
+                let s = &sents[rng.below(sents.len())];
+                let e = if k == EditKind::Homophone {
+                    celso::synth::corrupt_homophone(&checker.tok, s, &readings, &mut rng)
+                } else {
+                    corrupt(&checker.tok, s, k, &infl, &mut rng)
+                };
+                if let Some(e) = e {
+                    let (p, q) = write(&mut w, &e.text, Some(&e.clean), d)?;
+                    np += p;
+                    nn += q;
+                    made += 1;
+                }
+            }
+        }
+        // 誤りのない文 (誤検出を学ぶため)。文書全体の文を使う
+        for s in &sents {
+            let (_, q) = write(&mut w, s, None, d)?;
+            nn += q;
+        }
+        eprintln!("{path}: {np} positive / {nn} negative candidates");
+    }
+    if let Some(path) = jwtd {
+        let (mut np, mut nn, mut used) = (0, 0, 0);
+        for line in std::fs::read_to_string(path)?.lines() {
+            if used >= jwtd_limit {
+                break;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            if v["diffs"].as_array().is_none_or(|d| d.len() != 1) {
+                continue;
+            }
+            let pre = norm(v["pre_text"].as_str().unwrap_or(""));
+            let post = norm(v["post_text"].as_str().unwrap_or(""));
+            if pre == post {
+                continue;
+            }
+            used += 1;
+            let (p, q) = write(&mut w, &pre, Some(&post), Domain::General)?;
+            let (_, q2) = write(&mut w, &post, None, Domain::General)?;
+            np += p;
+            nn += q + q2;
+        }
+        eprintln!(
+            "{}: {used} pairs, {np} positive / {nn} negative candidates",
+            path.display()
+        );
     }
     Ok(())
 }

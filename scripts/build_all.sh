@@ -50,6 +50,10 @@ python3 scripts/exclude_eval.py fixtures/yokohama_shizei_jorei.txt < data/corpus
 # 5b. 契約書 (官公庁などのモデル契約書・標準約款・ガイドライン)。手順は scripts/contracts/README.md
 #     評価に使う JEITA / IPA アジャイル開発版は含めない。IPA モデル取引・契約書は評価データと重なる行を除いて足す
 uv run --with pypdf --with cryptography python scripts/contracts/eval_docs.py data/eval_contracts
+# 評価・判定器の学習には、文中の改行をつないだ版を使う (scripts/contracts/reflow.py)
+for n in jeita_dev jeita_test ipa_agile_test; do
+  python3 scripts/contracts/reflow.py data/eval_contracts/$n.txt data/eval_contracts/$n.reflow.txt
+done
 (cd scripts/contracts && for b in batch1 batch2 batch3 batch4; do python3 fetch.py batch $b.tsv; done \
   && uv run --with pypdf --with cryptography python dump_raw.py \
   && python3 build_contracts.py --out ../../data/corpus/contracts.txt)
@@ -82,6 +86,56 @@ $BIN vocab --size 50000 -o data/vocab50k.txt "${INPUTS[@]}"
 $BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt \
   --ctx-vocab data/vocab50k.txt --stats data/cooc_stats.bin --top-k 128 --min-pair 3 --weight-by-count \
   -o data/cooc.bin "${INPUTS[@]}"
-# 9. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
+# 9. 文法モデル (機能語だけ表層形・内容語は品詞クラスの 5-gram、約 2MB)。判定器の特徴量に使う
+python3 scripts/func_vocab.py data/vocab_func.txt data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc data/corpus/contracts2.wc
+FUNC_INPUTS=(data/corpus/egov.wc data/corpus/reiki.wc); for i in $(seq 1 10); do FUNC_INPUTS+=(data/corpus/contracts2.wc); done
+$BIN build-lm --order 5 --vocab data/vocab_func.txt --min-word-count 1 --min-count 1,5,20,50,100 -o data/func.bin "${FUNC_INPUTS[@]}"
+
+# 10. 誤字パターン (JWTD train の実際の誤字から。CC BY-SA 3.0)
+#     候補の抽出 → 全コーパスでの出現数 → 1 段目の選別 → 分野のコーパスでの出現数 → 2 段目 (分野・送り仮名)
+python3 scripts/patterns/extract.py data/jwtd/train.jsonl data/patterns_cand.tsv
+$BIN count-patterns data/patterns_cand.tsv -o data/patterns_counted.tsv \
+  data/corpus/egov.txt data/corpus/reiki.f.txt data/corpus/wiki12.f.txt data/corpus/contracts2.txt
+python3 scripts/patterns/select.py data/patterns_counted.tsv data/patterns_sel.tsv
+cut -f1-4 data/patterns_sel.tsv > data/patterns_sel4.tsv
+DOMAIN=(data/corpus/egov.txt data/corpus/reiki.f.txt); for i in $(seq 1 10); do DOMAIN+=(data/corpus/contracts2.txt); done
+$BIN count-patterns data/patterns_sel4.tsv -o data/patterns_domain.tsv "${DOMAIN[@]}"
+python3 scripts/patterns/filter.py data/patterns_domain.tsv data/patterns.tsv
+
+# 11. 判定器 (ロジスティック回帰)。学習には評価に使わない文書だけを使う:
+#     学習に入れていない 2 自治体 (一宮市・高槻市) の例規、JEITA モデル契約 (大、調整用)、JWTD train (先頭 5000 件は開発用に除く)
+python3 scripts/fetch_reiki.py --all --sites 高槻市,加古川市,一宮市,生駒市 --max-pages 150 \
+  --cache ~/celso-data/reiki_heldout_html --out data/corpus/reiki_heldout.txt
+for c in 一宮市 高槻市 加古川市 生駒市; do
+  python3 scripts/fetch_reiki.py --all --extract-only --sites $c --cache ~/celso-data/reiki_heldout_html --out data/corpus/heldout_$c.raw.txt
+done
+# 学習コーパスと完全一致する行 (各地で同じ条文) は除く: scripts/heldout_dedup.py
+python3 scripts/heldout_dedup.py
+tail -n +5001 data/jwtd/train.jsonl > data/jwtd/train_rest.jsonl
+$BIN dump-rerank --aux-model data/func.bin --patterns none \
+  --synth data/corpus/heldout_一宮市.txt:legal:600 --synth data/corpus/heldout_高槻市.txt:legal:600 \
+  --synth data/eval_contracts/jeita_dev.reflow.txt:contract:600 \
+  --jwtd data/jwtd/train_rest.jsonl --jwtd-limit 30000 --floor 1.0 -o data/rerank_train.tsv
+# 一般文の人工誤り (Wikipedia の 2 本目のダンプ。言語モデルには入れていない) も足す。JWTD だけだと
+# 一般文の余計な助詞 (「土産物から店」) の正例が少なく、判定器が助詞の削除を強く嫌う
+python3 scripts/heldout_wiki2.py
+$BIN dump-rerank --aux-model data/func.bin --patterns none \
+  --synth data/corpus/heldout_wiki2_train.txt:general:3000 --floor 1.0 -o data/rerank_train_wiki2.tsv
+$BIN train-rerank data/rerank_train.tsv data/rerank_train_wiki2.tsv -o data/rerank.tsv
+# 閾値 (対数オッズ) は調整用データ (JWTD 先頭 5000 件・wiki2 test・一宮市・JEITA 大) で決めた値を書き込む:
+# 法令文 -1.5、一般文 -0.5、契約書 0.5
+# 活用の誤り (「多くあろう → ある」) は JWTD の言い換え (〜であろう) に引きずられて判定器が強く負に振れるので、
+# 判定器を使わず種類ごとの閾値で決める。一般文の余計な助詞 (「西口側までは → は」) は判定器のスコアが
+# -1.0 前後に出るので、一般文の削除だけ閾値を -1.2 まで下げる (tests/regression で固定)
+python3 - <<'PY'
+p = 'data/rerank.tsv'
+lines = [l for l in open(p).read().split('\n') if not l.startswith(('#exempt', '#tau_kind'))]
+lines = ['#tau\t-1.5,-0.5,0.5' if l.startswith('#tau\t') else l for l in lines]
+i = next(k for k, l in enumerate(lines) if l.startswith('#floor'))
+lines[i + 1:i + 1] = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.2,0.5']
+open(p, 'w').write('\n'.join(lines))
+PY
+
+# 12. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
-cp data/model.bin data/cooc.bin data/dist/
+cp data/model.bin data/cooc.bin data/func.bin data/rerank.tsv data/patterns.tsv data/dist/

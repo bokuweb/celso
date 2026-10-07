@@ -150,7 +150,7 @@ pub fn corrupt(
             })
         }
         // 同音異字・文字単位の人工誤りは未実装 (JWTD の実データで評価する)
-        EditKind::Homophone | EditKind::Char => None,
+        EditKind::Homophone | EditKind::Char | EditKind::Pattern => None,
     }
 }
 

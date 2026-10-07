@@ -299,6 +299,7 @@ dependencies = [
 name = "celso"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "bincode",
  "candle-core",

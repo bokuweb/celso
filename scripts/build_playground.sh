@@ -24,7 +24,7 @@ wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sig
   $OUT/pkg/celso_playground_bg.wasm -o $OUT/pkg/celso_playground_bg.wasm
 
 mkdir -p $OUT/assets
-for f in model.bin cooc.bin inflections.tsv readings.tsv; do
+for f in model.bin cooc.bin inflections.tsv readings.tsv func.bin rerank.tsv patterns.tsv; do
   gzip -9c "$DIST/$f" > "$OUT/assets/$f.gz"
 done
 for f in lex.csv matrix.def char.def unk.def; do

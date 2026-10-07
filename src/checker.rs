@@ -26,6 +26,8 @@ pub enum EditKind {
     Homophone,
     /// 文字単位の衍字・脱字・転字
     Char,
+    /// 実際の誤字から集めた書き換えパターン (をを → を、れいる → れている)。[`crate::patterns`]
+    Pattern,
 }
 
 impl EditKind {
@@ -37,6 +39,7 @@ impl EditKind {
             EditKind::Insert => "insert",
             EditKind::Homophone => "homophone",
             EditKind::Char => "char",
+            EditKind::Pattern => "pattern",
         }
     }
 }
@@ -156,6 +159,8 @@ pub struct Config {
     pub doc_repeat_limit: usize,
     /// 同音異字の候補に足す共起の差の重み (log10 換算の Δ に、PMI 差 × 重み / ln10 を足す)。
     pub cooc_weight: f32,
+    /// 文法モデル (内容語を品詞クラスにまとめた高次 n-gram) の Δ に掛ける重み。助詞の削除・置換・補いにだけ足す。
+    pub aux_weight: f32,
     /// MLM の重み (最終スコア = n-gram Δ + mlm_weight × MLM Δ)。
     pub mlm_weight: f32,
     /// MLM 併用時、1 段目は閾値からこの幅だけ下の候補まで残して 2 段目に回す。
@@ -188,6 +193,7 @@ impl Default for Config {
         t.insert(EditKind::Homophone, 4.0);
         // 文字単位の編集は遅く誤検出も多いので既定では無効 (README 参照)
         t.insert(EditKind::Char, f32::INFINITY);
+        t.insert(EditKind::Pattern, 0.0);
         Self {
             // 一般文: JWTD の gold (開発用) で種類ごとに決めた値。活用と取り違えは
             // 一般文で正しい言い換えを拾いやすいので、法令文より大きく上げる
@@ -198,6 +204,7 @@ impl Default for Config {
                 (EditKind::Insert, 4.0),
                 (EditKind::Homophone, 4.5),
                 (EditKind::Char, f32::INFINITY),
+                (EditKind::Pattern, 0.0),
             ]
             .into_iter()
             .collect(),
@@ -209,6 +216,7 @@ impl Default for Config {
                 (EditKind::Insert, 4.5),
                 (EditKind::Homophone, 5.0),
                 (EditKind::Char, f32::INFINITY),
+                (EditKind::Pattern, 0.0),
             ]
             .into_iter()
             .collect(),
@@ -219,6 +227,7 @@ impl Default for Config {
             doc_repeat_limit: 2,
             mlm_weight: 1.0,
             cooc_weight: 1.0,
+            aux_weight: 0.0,
             stage1_slack: 1.5,
             top_k: 4,
             mlm_margin: 1,
@@ -279,10 +288,20 @@ pub struct Checker {
     mlm: Option<Mlm>,
     /// 同音異字の判定に使う文内共起モデル (無ければ n-gram だけで判定)
     cooc: Option<crate::cooc::Cooc>,
+    /// 文法モデル (無ければ使わない)。機能語だけ表層形で持ち、内容語は品詞クラスにした高次 n-gram で、
+    /// 単語 3-gram (前後 2 語) より長い範囲の助詞の並びを見る
+    aux: Option<Box<dyn LanguageModel>>,
+    /// 採否の判定器 (無ければ種類ごとの閾値で決める)
+    rerank: Option<crate::rerank::Reranker>,
+    /// 実際の誤字から集めた書き換えパターン (無ければ使わない)
+    patterns: Option<crate::patterns::Patterns>,
     /// 文単位の結果キャッシュ (正規化済みの文のハッシュ → その文の指摘)。
     /// 指摘は文の中身だけで決まる (文書内繰り返しの抑制は文書全体で毎回かけ直す) ので、
     /// 編集されていない文は再計算しなくてよい。
     cache: Option<std::sync::RwLock<FxHashMap<u64, Vec<Finding>>>>,
+    /// CELSO_TRACE が設定されていれば、閾値に届かなかった候補も含めて採点の内訳を stderr へ出す
+    /// (ケースの調査用。組み込み先では設定しない)
+    trace: bool,
 }
 
 /// キャッシュの上限 (文の数)。超えたら丸ごと捨てる (単純さ優先。1 文書は数千文程度)。
@@ -320,11 +339,36 @@ impl Checker {
             readings,
             mlm: None,
             cooc: None,
+            aux: None,
+            rerank: None,
+            patterns: None,
             cache: None,
+            trace: std::env::var_os("CELSO_TRACE").is_some(),
         }
     }
 
     /// 同音異字の判定に文内共起モデルを使う。
+    /// 文法モデルを使う (重みは [`Config::aux_weight`])。
+    #[must_use]
+    pub fn with_aux(mut self, aux: Box<dyn LanguageModel>) -> Self {
+        self.aux = Some(aux);
+        self
+    }
+
+    /// 採否を判定器で決める (閾値は判定器の文書種類ごとの値になる)。
+    #[must_use]
+    pub fn with_rerank(mut self, rerank: crate::rerank::Reranker) -> Self {
+        self.rerank = Some(rerank);
+        self
+    }
+
+    /// 書き換えパターンの照合を使う。
+    #[must_use]
+    pub fn with_patterns(mut self, patterns: crate::patterns::Patterns) -> Self {
+        self.patterns = Some(patterns);
+        self
+    }
+
     pub fn with_cooc(mut self, cooc: crate::cooc::Cooc) -> Self {
         self.cooc = Some(cooc);
         self
@@ -495,68 +539,36 @@ impl Checker {
             return Vec::new();
         }
         let ids = self.ids_of(&toks);
-        // MLM が無くても、閾値の 1.0 下までは別案として見せるために残す
-        let slack = if self.mlm.is_some() {
-            self.cfg.stage1_slack.max(1.0)
-        } else {
-            1.0
-        };
-
-        let mut cands: Vec<Finding> = Vec::new();
-        let mut buf: Vec<u32> = Vec::with_capacity(32);
-        let mut repl_buf = [0u32; 1];
-        // 未出現ゲートの判定は語の位置ごとに 1 回だけ行い、候補間で使い回す
-        let novel = self.novel_positions(&ids);
-        let mut cooc_ctx: Option<Vec<u32>> = None;
-        for c in self.candidates(&toks) {
-            let repl_ids: &[u32] = match c.repl {
-                None => &[],
-                Some(w) => {
-                    repl_buf[0] = self.lm.word_id(w);
-                    &repl_buf
-                }
-            };
-            if repl_ids.contains(&UNK) {
-                continue;
-            }
-            let th = self.threshold(c.kind, d) - slack;
-            if !th.is_finite() || !Self::is_novel(&ids, &novel, c.a + 1, c.b + 1) {
-                continue;
-            }
-            let mut delta = self.delta(&ids, c.a + 1, c.b + 1, repl_ids, &mut buf);
-            // 同音異字は文全体の語との相性も足す (n-gram の前後 2 語だけでは決まらないため)
-            if c.kind == EditKind::Homophone
-                && let Some(cooc) = &self.cooc
-            {
-                let ctx = cooc_ctx.get_or_insert_with(|| {
-                    cooc.context(self.lm.as_ref(), toks.iter().map(|t| t.surface.as_str()))
-                });
-                let orig = self.lm.word_id(toks[c.a].key());
-                // 置き換える元の語そのものは手がかりに数えない
-                let skip = cooc.ctx_id(self.lm.as_ref(), &toks[c.a].surface);
-                let diff = cooc.score(repl_ids[0], ctx, skip) - cooc.score(orig, ctx, skip);
-                delta += self.cfg.cooc_weight * diff / std::f32::consts::LN_10;
-            }
-            if delta >= th {
-                let start = toks
-                    .get(c.a)
-                    .map(|t| t.start)
-                    .unwrap_or_else(|| toks.last().unwrap().end);
-                let end = if c.b > c.a { toks[c.b - 1].end } else { start };
-                cands.push(Finding {
-                    start,
-                    end,
-                    original: toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect(),
-                    replacement: c.repl.unwrap_or("").to_string(),
-                    kind: c.kind,
-                    delta,
-                    alternatives: Vec::new(),
-                });
-            }
-        }
+        let mut cands: Vec<Finding> = self
+            .scan(&toks, &ids, d, false, None)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
         if self.threshold(EditKind::Char, d).is_finite() {
             cands.extend(self.char_edits(sent, &toks, &ids, d));
         }
+        if let Some(p) = &self.patterns {
+            let found = p.find(sent);
+            if !found.is_empty() {
+                // パターンは前後の文脈を見ないので (「なってしまします → しまいます」は正しいが
+                // 「いたしまします」には当てはまらない)、直した文の n-gram の尤度が大きく下がるものは捨てる
+                let base = self.sentence_logp(&ids);
+                for f in found {
+                    let fixed = apply_finding(sent, &f);
+                    let d = self.sentence_logp(&self.ids_of(&self.tok.tokenize(&fixed))) - base;
+                    if self.trace {
+                        eprintln!(
+                            "  [pattern] 「{}」→「{}」 文の Δ={d:.2}",
+                            f.original, f.replacement
+                        );
+                    }
+                    if d >= PATTERN_MIN_SENTENCE_DELTA {
+                        cands.push(f);
+                    }
+                }
+            }
+        }
+        cands.extend(repeated_function_words(&toks));
         // 箇所にまとめる: 1 文字以内で隣り合う候補は同じ誤りの別解とみなす
         // (「飲食は店」の「は」を消す案と「店」を消す案など)
         cands.sort_by_key(|f| (f.start, f.end));
@@ -580,6 +592,365 @@ impl Checker {
             site.truncate(self.cfg.top_k);
         }
         sites
+    }
+
+    /// 判定器の学習データ用: 文の候補 (n-gram Δ が `floor` 以上) と特徴量を返す。
+    /// `Finding::delta` は判定器を使わない場合と同じ n-gram の Δ (共起・文法モデルの重みを含む)。
+    pub fn candidate_features(
+        &self,
+        sent: &str,
+        d: Domain,
+        floor: f32,
+    ) -> Vec<(Finding, crate::rerank::Features)> {
+        let toks = self.tok.tokenize(sent);
+        if toks.is_empty() {
+            return Vec::new();
+        }
+        let ids = self.ids_of(&toks);
+        self.scan(&toks, &ids, d, true, Some(floor))
+            .into_iter()
+            .filter_map(|(f, x)| x.map(|x| (f, x)))
+            .collect()
+    }
+
+    /// 修正候補を採点して、閾値 (判定器があればその床) を超えたものを返す。
+    /// 判定器があるときは `delta` を判定器の対数オッズに置き換える。
+    /// `dump` が真なら判定器を通さず、`floor` 以上の候補をすべて特徴量つきで返す。
+    fn scan(
+        &self,
+        toks: &[Token],
+        ids: &[u32],
+        d: Domain,
+        dump: bool,
+        floor: Option<f32>,
+    ) -> Vec<(Finding, Option<crate::rerank::Features>)> {
+        // MLM が無くても、閾値の 1.0 下までは別案として見せるために残す
+        let slack = if self.mlm.is_some() {
+            self.cfg.stage1_slack.max(1.0)
+        } else {
+            1.0
+        };
+        let rerank = if dump { None } else { self.rerank.as_ref() };
+        let mut out = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(32);
+        let mut repl_buf = [0u32; 1];
+        // 未出現ゲートの判定は語の位置ごとに 1 回だけ行い、候補間で使い回す
+        let novel = self.novel_positions(ids);
+        let mut cooc_ctx: Option<Vec<u32>> = None;
+        let mut aux_ids: Option<(Vec<u32>, Vec<f32>)> = None;
+        // 元の文の各位置の対数確率 (候補ごとに同じ値を計算し直さない)
+        let lp = position_logps(self.lm.as_ref(), ids);
+        for c in self.candidates(toks) {
+            let repl_ids: &[u32] = match c.repl {
+                None => &[],
+                Some(w) => {
+                    repl_buf[0] = self.lm.word_id(w);
+                    &repl_buf
+                }
+            };
+            if repl_ids.contains(&UNK) {
+                continue;
+            }
+            // 判定器を使わない候補は、種類ごとの閾値で決める。`#exempt` には種類名のほか、
+            // 「活用語 + 推量の助動詞」をまとめて直す活用の候補 (「多くあろう → ある」) を表す
+            // `inflection-aux` を書ける (判定器は JWTD の「〜であろう」の言い換えに引きずられて強く嫌うため)
+            let aux_drop = c.kind == EditKind::Inflection && c.b > c.a + 1;
+            let exempt = |r: &crate::rerank::Reranker| {
+                r.is_exempt(c.kind.label()) || (aux_drop && r.is_exempt(INFLECTION_AUX))
+            };
+            let rerank_here = rerank.filter(|r| !exempt(r));
+            let th = match (floor, rerank_here) {
+                (Some(f), _) => f,
+                (None, Some(r)) => r.floor,
+                (None, None) => self.base_threshold(c.kind, d) - slack,
+            };
+            if !th.is_finite() || !Self::is_novel(ids, &novel, c.a + 1, c.b + 1) {
+                if self.trace && th.is_finite() {
+                    self.trace_cand(toks, &c, "既出の並び", None, None);
+                }
+                continue;
+            }
+            let ngram = delta_pre(
+                self.lm.as_ref(),
+                ids,
+                &lp,
+                c.a + 1,
+                c.b + 1,
+                repl_ids,
+                &mut buf,
+            );
+            let mut delta = ngram;
+            // 文法モデル (前後 4 語の助詞の並び) の Δ。判定器の特徴量にも使う
+            let mut aux_delta: Option<f32> = None;
+            if matches!(
+                c.kind,
+                EditKind::Delete | EditKind::Substitute | EditKind::Insert
+            ) && let Some(aux) = &self.aux
+                && (self.cfg.aux_weight != 0.0 || dump || rerank.is_some())
+            {
+                let aux_repl = c.repl.map(|w| aux.word_id(w));
+                if aux_repl != Some(UNK) {
+                    let (s, alp) = aux_ids.get_or_insert_with(|| {
+                        let mut v = Vec::with_capacity(toks.len() + 2);
+                        v.push(BOS);
+                        v.extend(toks.iter().map(|t| aux.token_id(t)));
+                        v.push(EOS);
+                        let lp = position_logps(aux.as_ref(), &v);
+                        (v, lp)
+                    });
+                    let r: &[u32] = match &aux_repl {
+                        Some(id) => std::slice::from_ref(id),
+                        None => &[],
+                    };
+                    let ad = delta_pre(aux.as_ref(), s, alp, c.a + 1, c.b + 1, r, &mut buf);
+                    aux_delta = Some(ad);
+                    if c.kind == EditKind::Substitute {
+                        delta += self.cfg.aux_weight * ad;
+                    }
+                }
+            }
+            // 同音異字は文全体の語との相性も足す (n-gram の前後 2 語だけでは決まらないため)
+            let mut cooc_term: Option<f32> = None;
+            if c.kind == EditKind::Homophone
+                && let Some(cooc) = &self.cooc
+            {
+                let ctx = cooc_ctx.get_or_insert_with(|| {
+                    cooc.context(self.lm.as_ref(), toks.iter().map(|t| t.surface.as_str()))
+                });
+                let orig = self.lm.word_id(toks[c.a].key());
+                // 置き換える元の語そのものは手がかりに数えない
+                let skip = cooc.ctx_id(self.lm.as_ref(), &toks[c.a].surface);
+                let diff = cooc.score(repl_ids[0], ctx, skip) - cooc.score(orig, ctx, skip);
+                let term = diff / std::f32::consts::LN_10;
+                cooc_term = Some(term);
+                delta += self.cfg.cooc_weight * term;
+            }
+            if delta < th {
+                if self.trace {
+                    self.trace_cand(toks, &c, "Δ不足", Some(delta), None);
+                }
+                continue;
+            }
+            let nov = || {
+                novel[c.a + 1..(c.b + 3).min(novel.len())]
+                    .iter()
+                    .filter(|v| **v)
+                    .count()
+            };
+            let feats = if dump {
+                Some(self.features(toks, &c, d, ngram, aux_delta, cooc_term, nov()))
+            } else {
+                None
+            };
+            // 判定器があるのに使わなかった候補は、種類ごとの閾値との差を判定器の閾値の尺度へ移す
+            // (最後の採否と箇所内の順位付けは判定器の閾値で行うため)
+            if let Some(r) = rerank.filter(|r| exempt(r)) {
+                delta = delta - self.base_threshold(c.kind, d) + r.tau_for(c.kind.label(), d);
+            }
+            if let Some(r) = rerank_here {
+                delta = self.rerank_score(r, toks, &c, d, ngram, aux_delta, cooc_term, nov());
+                if self.trace {
+                    self.trace_cand(
+                        toks,
+                        &c,
+                        "判定器",
+                        Some(ngram),
+                        Some((delta, r.tau_for(c.kind.label(), d))),
+                    );
+                }
+            }
+            let start = toks
+                .get(c.a)
+                .map(|t| t.start)
+                .unwrap_or_else(|| toks.last().unwrap().end);
+            let end = if c.b > c.a { toks[c.b - 1].end } else { start };
+            out.push((
+                Finding {
+                    start,
+                    end,
+                    original: toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect(),
+                    replacement: c.repl.unwrap_or("").to_string(),
+                    kind: c.kind,
+                    delta,
+                    alternatives: Vec::new(),
+                },
+                feats,
+            ));
+        }
+        out
+    }
+
+    fn trace_cand(
+        &self,
+        toks: &[Token],
+        c: &Cand<'_>,
+        why: &str,
+        ngram: Option<f32>,
+        rerank: Option<(f32, f32)>,
+    ) {
+        let orig: String = toks[c.a..c.b].iter().map(|t| t.surface.as_str()).collect();
+        let before: String = toks[c.a.saturating_sub(2)..c.a]
+            .iter()
+            .map(|t| t.surface.as_str())
+            .collect();
+        let after: String = toks[c.b..(c.b + 2).min(toks.len())]
+            .iter()
+            .map(|t| t.surface.as_str())
+            .collect();
+        let ngram = ngram.map_or_else(String::new, |x| format!(" Δ={x:.2}"));
+        let rerank =
+            rerank.map_or_else(String::new, |(z, t)| format!(" 判定={z:.2} (閾値 {t:.2})"));
+        eprintln!(
+            "  [{why}] {} {before}[{orig}→{}]{after}{ngram}{rerank}",
+            c.kind.label(),
+            c.repl.unwrap_or("")
+        );
+    }
+
+    /// 判定器の特徴量 (学習データの書き出し用に名前つきで集める)。
+    #[allow(clippy::too_many_arguments)]
+    fn features(
+        &self,
+        toks: &[Token],
+        c: &Cand<'_>,
+        d: Domain,
+        ngram: f32,
+        aux: Option<f32>,
+        cooc: Option<f32>,
+        novel: usize,
+    ) -> crate::rerank::Features {
+        let mut f: crate::rerank::Features = Vec::with_capacity(20);
+        self.emit_features(toks, c, d, ngram, aux, cooc, novel, &mut |k, v| {
+            f.push((k.to_string(), v))
+        });
+        f
+    }
+
+    /// 判定器のスコア (特徴量の名前を確保せず、使い回しのバッファでハッシュを引く)。
+    #[allow(clippy::too_many_arguments)]
+    fn rerank_score(
+        &self,
+        r: &crate::rerank::Reranker,
+        toks: &[Token],
+        c: &Cand<'_>,
+        d: Domain,
+        ngram: f32,
+        aux: Option<f32>,
+        cooc: Option<f32>,
+        novel: usize,
+    ) -> f32 {
+        let mut z = 0.0;
+        self.emit_features(toks, c, d, ngram, aux, cooc, novel, &mut |k, v| {
+            z += r.weight(k) * v
+        });
+        z
+    }
+
+    /// 判定器の特徴量を 1 つずつ `emit(名前, 値)` に渡す。名前は「種類:内容」の形にして、
+    /// 種類ごとに別の重みを持たせる。
+    #[allow(clippy::too_many_arguments)]
+    fn emit_features(
+        &self,
+        toks: &[Token],
+        c: &Cand<'_>,
+        d: Domain,
+        ngram: f32,
+        aux: Option<f32>,
+        cooc: Option<f32>,
+        novel: usize,
+        emit: &mut dyn FnMut(&str, f32),
+    ) {
+        use std::fmt::Write as _;
+        let k = c.kind.label();
+        let bin = |x: f32| (x.floor() as i32).clamp(-2, 15);
+        // 機能語 (助詞・助動詞・記号) は表層形、それ以外は品詞で表す
+        let key = |t: Option<&Token>, buf: &mut String| match t {
+            None => buf.push_str("<s>"),
+            Some(t) if matches!(t.pos, "助詞" | "助動詞" | "記号") => {
+                buf.push_str(&t.surface)
+            }
+            Some(t) => {
+                let _ = write!(buf, "{}-{}", t.pos, t.pos1);
+            }
+        };
+        let mut buf = String::with_capacity(64);
+        let put = |buf: &mut String, v: f32, emit: &mut dyn FnMut(&str, f32)| {
+            emit(buf, v);
+            buf.clear();
+        };
+        emit("b", 1.0);
+        let _ = write!(buf, "k={k}");
+        put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:d");
+        put(&mut buf, ngram, emit);
+        let _ = write!(buf, "{k}:db{}", bin(ngram));
+        put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:dom={d:?}");
+        put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:nov{novel}");
+        put(&mut buf, 1.0, emit);
+        if let Some(a) = aux {
+            let _ = write!(buf, "{k}:aux");
+            put(&mut buf, a, emit);
+            let _ = write!(buf, "{k}:ab{}", bin(a));
+            put(&mut buf, 1.0, emit);
+        }
+        if let Some(x) = cooc {
+            let _ = write!(buf, "{k}:cooc");
+            put(&mut buf, x, emit);
+        }
+        let repl = c.repl.unwrap_or("");
+        match c.kind {
+            EditKind::Delete | EditKind::Substitute | EditKind::Insert => {
+                let orig_len: usize = toks[c.a..c.b]
+                    .iter()
+                    .map(|t| t.surface.chars().count())
+                    .sum();
+                if orig_len <= 4 {
+                    let _ = write!(buf, "{k}:o=");
+                    for t in &toks[c.a..c.b] {
+                        buf.push_str(&t.surface);
+                    }
+                    put(&mut buf, 1.0, emit);
+                }
+                let _ = write!(buf, "{k}:r={repl}");
+                put(&mut buf, 1.0, emit);
+                if c.kind == EditKind::Substitute {
+                    let _ = write!(buf, "{k}:or=");
+                    for t in &toks[c.a..c.b] {
+                        buf.push_str(&t.surface);
+                    }
+                    let _ = write!(buf, ">{repl}");
+                    put(&mut buf, 1.0, emit);
+                }
+            }
+            EditKind::Inflection => {
+                if let Some(t) = toks.get(c.a) {
+                    let _ = write!(buf, "{k}:of={}", t.conj_form);
+                    put(&mut buf, 1.0, emit);
+                    let _ = write!(buf, "{k}:ob={}", t.base);
+                    put(&mut buf, 1.0, emit);
+                }
+            }
+            EditKind::Homophone | EditKind::Char | EditKind::Pattern => {}
+        }
+        let prev = if c.a > 0 { toks.get(c.a - 1) } else { None };
+        let next = toks.get(c.b);
+        let _ = write!(buf, "{k}:p=");
+        key(prev, &mut buf);
+        put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:n=");
+        key(next, &mut buf);
+        put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:pn=");
+        key(prev, &mut buf);
+        buf.push('|');
+        key(next, &mut buf);
+        put(&mut buf, 1.0, emit);
+        if next.is_none_or(|t| t.surface == "。") {
+            let _ = write!(buf, "{k}:end");
+            put(&mut buf, 1.0, emit);
+        }
     }
 
     /// 箇所ごとに最良案のスコアが閾値を超えたら指摘し、残りは別案として添える。
@@ -827,6 +1198,18 @@ impl Checker {
     }
 
     fn threshold(&self, k: EditKind, d: Domain) -> f32 {
+        // 判定器があるときは、種類によらず判定器の閾値 (対数オッズ) で決める (文字単位の候補は除く)
+        // (判定器を使わなかった候補も、scan で Δ をこの尺度へ移してある)
+        if let Some(r) = &self.rerank
+            && !matches!(k, EditKind::Char | EditKind::Pattern)
+        {
+            return r.tau_for(k.label(), d);
+        }
+        self.base_threshold(k, d)
+    }
+
+    /// 種類ごとの閾値 (判定器を使わない場合の値)。
+    fn base_threshold(&self, k: EditKind, d: Domain) -> f32 {
         let t = match d {
             Domain::Legal => &self.cfg.thresholds,
             Domain::General => &self.cfg.general_thresholds,
@@ -970,31 +1353,6 @@ impl Checker {
             .collect()
     }
 
-    /// S[a..b] を repl に置き換えたときの対数確率の改善幅。
-    fn delta(&self, s: &[u32], a: usize, b: usize, repl: &[u32], buf: &mut Vec<u32>) -> f32 {
-        let order = self.lm.order();
-        let ctx_start = a.saturating_sub(order - 1);
-        // 元: S[a .. b + order - 1) を採点 (文末で打ち切り)
-        let tail_end = (b + order - 1).min(s.len());
-        let mut orig = 0.0;
-        for j in a..tail_end {
-            orig += self
-                .lm
-                .logp(&s[ctx_start.max(j.saturating_sub(order - 1))..j], s[j]);
-        }
-        // 編集後: 文脈 + repl + S[b .. tail_end)
-        buf.clear();
-        buf.extend_from_slice(&s[ctx_start..a]);
-        let first = buf.len();
-        buf.extend_from_slice(repl);
-        buf.extend_from_slice(&s[b..tail_end]);
-        let mut new = 0.0;
-        for j in first..buf.len() {
-            new += self.lm.logp(&buf[j.saturating_sub(order - 1)..j], buf[j]);
-        }
-        new - orig
-    }
-
     fn candidates(&self, toks: &[Token]) -> Vec<Cand<'_>> {
         let mut out = Vec::new();
         for (i, t) in toks.iter().enumerate() {
@@ -1028,7 +1386,21 @@ impl Checker {
             let before_kakari = is_particle
                 && matches!(t.surface.as_str(), "から" | "で" | "と" | "より")
                 && toks.get(i + 1).is_some_and(is_kakari);
-            let no_delete = after_particle || before_kakari;
+            // 名詞と名詞をつなぐ「の」(「無料のシャトルバス」「宿泊の施設」) は、消しても残しても文が成立する。
+            // 複合語 (「無料シャトルバス」) の n-gram が強いと誤りに見えるが、実際の誤字ではほぼ起きないので消さない
+            let genitive_between_nouns = t.surface == "の"
+                && is_particle
+                && i > 0
+                && toks[i - 1].pos == "名詞"
+                && toks
+                    .get(i + 1)
+                    .is_some_and(|x| x.pos == "名詞" && !matches!(x.pos1, "非自立" | "接尾"));
+            // 「次回までに」「月末までに」の「までに」は期限を表す一続きの言い方なので、「まで」を消す候補にしない
+            // (「西口側までは」の「まで」は消す候補に残す)
+            let deadline_madeni =
+                t.surface == "まで" && toks.get(i + 1).is_some_and(|x| x.surface == "に");
+            let no_delete =
+                after_particle || before_kakari || genitive_between_nouns || deadline_madeni;
             if (is_simple_particle || is_hira1 || dup) && !parallel && !no_delete {
                 out.push(Cand {
                     a: i,
@@ -1054,8 +1426,20 @@ impl Checker {
                     }
                 }
             }
+            // 文末の命令形 (判決主文の「支払え。」) と話し言葉の縮約 (「進めてる」「書いとく」) は書き手が選んだ形で、
+            // 誤字ではないので活用を直す候補にしない。文中の命令形 (「支払え義務」) は打ち間違いのことがあるので残す
+            let sentence_final = toks
+                .get(i + 1)
+                .is_none_or(|x| x.pos == "記号" && matches!(x.pos1, "句点" | "括弧閉"));
+            let intentional_form = (t.conj_form.starts_with("命令") && sentence_final)
+                || (t.pos1 == "非自立"
+                    && matches!(
+                        t.base,
+                        "てる" | "でる" | "とく" | "どく" | "ちゃう" | "じゃう"
+                    ));
             if matches!(t.pos, "動詞" | "形容詞" | "助動詞")
                 && !t.conj_type.is_empty()
+                && !intentional_form
                 && let Some(forms) = self
                     .inflections
                     .get(&(t.base.to_string(), t.conj_type.to_string()))
@@ -1128,8 +1512,10 @@ impl Checker {
             }
             // 名詞 (または閉じ括弧「」」「)」) の直後で、次が助詞でも記号でもない位置か、読点の直前に補う
             // (「この条例□、公布の日から」「『納税義務者』□いう」)
+            // IPADIC は「お忙しい」「お美しい」を名詞にしているが、実際は形容詞なので後ろに助詞を補わない
+            // (「お忙しい□ところ」に「の」を補う誤検出になる)
             let prev_ok = i > 0
-                && (toks[i - 1].pos == "名詞"
+                && ((toks[i - 1].pos == "名詞" && !is_honorific_adjective(&toks[i - 1].surface))
                     || (toks[i - 1].pos == "記号" && toks[i - 1].pos1 == "括弧閉"));
             let next_ok = t.pos != "助詞" && (t.pos != "記号" || t.pos1 == "読点");
             if self.cfg.enable_insert && prev_ok && next_ok {
@@ -1200,8 +1586,105 @@ pub fn is_notation_variant(a: &str, b: &str) -> bool {
     a.chars().all(|c| b.contains(c)) || b.chars().all(|c| a.contains(c)) || is_listed_variant(a, b)
 }
 
+/// S の各位置 j の対数確率 (直前 order-1 語の文脈)。候補ごとの「元」の和を使い回すために文ごとに 1 回求める。
+fn position_logps(lm: &dyn LanguageModel, s: &[u32]) -> Vec<f32> {
+    let order = lm.order();
+    (0..s.len())
+        .map(|j| {
+            if j == 0 {
+                0.0
+            } else {
+                lm.logp(&s[j.saturating_sub(order - 1)..j], s[j])
+            }
+        })
+        .collect()
+}
+
+/// 言語モデル `lm` で、S[a..b] を repl に置き換えたときの対数確率の改善幅。
+/// 元の文の対数確率は文ごとに求めた `lp` ([`position_logps`]) を使い回す。
+fn delta_pre(
+    lm: &dyn LanguageModel,
+    s: &[u32],
+    lp: &[f32],
+    a: usize,
+    b: usize,
+    repl: &[u32],
+    buf: &mut Vec<u32>,
+) -> f32 {
+    let order = lm.order();
+    let ctx_start = a.saturating_sub(order - 1);
+    let tail_end = (b + order - 1).min(s.len());
+    let orig: f32 = lp[a..tail_end].iter().sum();
+    buf.clear();
+    buf.extend_from_slice(&s[ctx_start..a]);
+    let first = buf.len();
+    buf.extend_from_slice(repl);
+    buf.extend_from_slice(&s[b..tail_end]);
+    let mut new = 0.0;
+    for j in first..buf.len() {
+        new += lm.logp(&buf[j.saturating_sub(order - 1)..j], buf[j]);
+    }
+    new - orig
+}
+
 /// toks[a..b] の前後どちらかに、かな・漢字に挟まれた空白があるか。
 /// 「DX は」「第6 条」のような英数字の後ろの空白は Word の文書でも普通に書くので数えない。
+/// 同じ助詞・接頭辞が 2 つ続く打ち間違い (「土産物はは店」「ごご連絡」) を、2 つ目を消す指摘にする。
+///
+/// 助詞や接頭辞がそのまま 2 回続く正しい文はほぼ無い (「もも」「ここ」のような語は名詞として 1 語になる) ので、
+/// n-gram や判定器を通さずに出す (判定器は複合語の n-gram に引きずられて「は」の削除を嫌うことがある)。
+/// 種類は実データ由来のパターンと同じ扱い (閾値 0) にする。
+fn repeated_function_words(toks: &[Token]) -> Vec<Finding> {
+    toks.windows(2)
+        .filter(|w| {
+            w[0].surface == w[1].surface
+                && w[0].pos == w[1].pos
+                && matches!(w[0].pos, "助詞" | "接頭詞")
+                && w[0].end == w[1].start
+        })
+        .map(|w| Finding {
+            start: w[1].start,
+            end: w[1].end,
+            original: w[1].surface.clone(),
+            replacement: String::new(),
+            kind: EditKind::Pattern,
+            delta: REPEATED_WORD_SCORE,
+            alternatives: Vec::new(),
+        })
+        .collect()
+}
+
+/// 判定器の `#exempt` に書く、「活用語 + 推量の助動詞」をまとめて直す活用の候補の名前。
+pub const INFLECTION_AUX: &str = "inflection-aux";
+
+/// パターンの指摘を残す、直した文の n-gram 対数確率 (log10) の改善幅の下限。
+/// JWTD の開発用 (先頭 5000 件) で、検出率をほぼ落とさずに誤検出が減る値 (-6: 検出 34.1→34.0%、誤検出 8.7→8.5%/文)。
+const PATTERN_MIN_SENTENCE_DELTA: f32 = -6.0;
+
+fn apply_finding(sent: &str, f: &Finding) -> String {
+    let mut out = String::with_capacity(sent.len());
+    for (i, c) in sent.chars().enumerate() {
+        if i == f.start {
+            out.push_str(&f.replacement);
+        }
+        if i < f.start || i >= f.end {
+            out.push(c);
+        }
+    }
+    if f.start >= sent.chars().count() {
+        out.push_str(&f.replacement);
+    }
+    out
+}
+
+/// 助詞・接頭辞の重複の指摘のスコア (パターンのスコア = log10(支持数) に合わせ、支持数 100 相当)。
+const REPEATED_WORD_SCORE: f32 = 2.0;
+
+/// IPADIC で名詞になっている「お + 形容詞」(お忙しい・お美しい・お寂しい)。
+fn is_honorific_adjective(s: &str) -> bool {
+    (s.starts_with('お') || s.starts_with('ご')) && s.ends_with("しい") && s.chars().count() >= 4
+}
+
 fn touches_space(toks: &[Token], a: usize, b: usize) -> bool {
     let ja = |c: Option<char>| c.is_some_and(|c| is_kana(c) || is_kanji(c));
     let gap = |l: &Token, r: &Token| {
@@ -1373,9 +1856,135 @@ mod tests {
         // 「西口側までは」の「まで」は消す候補に残す
         let t = toks("西口側までは宿泊施設がある。");
         assert!(has_delete(&c, &t, "まで"));
+        // 期限の「までに」は消さない
+        let t = toks("次回までに案を示す。");
+        assert!(!has_delete(&c, &t, "まで"));
         // 名詞の直後の余計な「は」は従来どおり削除候補にする (「飲食は店」)
         let t = toks("飲食は店がある。");
         assert!(has_delete(&c, &t, "は"));
+    }
+
+    fn has_insert_before(c: &Checker, t: &[Token], surface: &str) -> bool {
+        let i = index_of(t, surface, 0);
+        c.candidates(t)
+            .iter()
+            .any(|x| x.a == i && x.b == i && x.kind == EditKind::Insert)
+    }
+
+    #[test]
+    fn no_particle_is_inserted_after_honorific_adjective() {
+        let Ok(c) = tiny_checker() else { return };
+        // IPADIC では「お忙しい」が名詞だが、「お忙しいのところ」にはしない
+        let t = toks("お忙しいところ恐縮です。");
+        assert!(!has_insert_before(&c, &t, "ところ"));
+        // 普通の名詞の後ろには従来どおり補う候補を出す (「宿泊□施設」)
+        let t = toks("宿泊施設がある。");
+        assert!(has_insert_before(&c, &t, "施設"));
+    }
+
+    fn has_inflection(c: &Checker, t: &[Token], surface: &str) -> bool {
+        let i = index_of(t, surface, 0);
+        c.candidates(t)
+            .iter()
+            .any(|x| x.a == i && x.kind == EditKind::Inflection)
+    }
+
+    /// 活用表に `text` の活用語 (原形, 活用型) と、ダミーの活用形を 1 つずつ入れた Checker。
+    fn checker_with_inflections_of(text: &str) -> anyhow::Result<(Checker, Vec<Token>)> {
+        let mut c = tiny_checker()?;
+        let t = toks(text);
+        for x in &t {
+            if !x.conj_type.is_empty() {
+                c.inflections.insert(
+                    (x.base.to_string(), x.conj_type.to_string()),
+                    vec![x.base.to_string(), "ダミー".into()],
+                );
+            }
+        }
+        Ok((c, t))
+    }
+
+    #[test]
+    fn imperative_and_colloquial_forms_are_not_inflection_errors() {
+        // 判決主文の命令形
+        let Ok((c, t)) = checker_with_inflections_of("被告は原告に金100万円を支払え。")
+        else {
+            return;
+        };
+        assert!(!has_inflection(&c, &t, "支払え"));
+        // 文中の命令形は打ち間違いの可能性があるので候補に残す
+        let Ok((c, t)) = checker_with_inflections_of("金100万円を支払え義務を負う。")
+        else {
+            return;
+        };
+        assert!(has_inflection(&c, &t, "支払え"));
+        // い抜き (話し言葉の縮約)
+        let Ok((c, t)) = checker_with_inflections_of("整備を進めてる。") else {
+            return;
+        };
+        assert!(!has_inflection(&c, &t, "てる"));
+        // 「多くあろう」は従来どおり活用の候補にする
+        let Ok((c, t)) = checker_with_inflections_of("飲食店など多くあろう") else {
+            return;
+        };
+        assert!(has_inflection(&c, &t, "あろ"));
+    }
+
+    #[test]
+    fn genitive_no_between_nouns_is_not_deleted() {
+        let Ok(c) = tiny_checker() else { return };
+        let t = toks("駅から無料のシャトルバスが出る。");
+        assert!(!has_delete(&c, &t, "の"));
+        // 動詞の後ろの余計な「の」(「課するのもの」) は従来どおり消す候補にする
+        let t = toks("個人に対して課するのものとする。");
+        assert!(has_delete(&c, &t, "の"));
+    }
+
+    #[test]
+    fn repeated_particle_or_prefix_is_removed() {
+        let f = repeated_function_words(&toks("土産物はは店が並ぶ。"));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            (
+                f[0].start,
+                f[0].end,
+                f[0].original.as_str(),
+                f[0].replacement.as_str()
+            ),
+            (4, 5, "は", "")
+        );
+        let f = repeated_function_words(&toks("折り返しごご連絡いたします。"));
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].start, f[0].end), (5, 6));
+        // 重複の無い文や、同じ字が語の一部として続くだけの文には出さない
+        assert!(
+            repeated_function_words(&toks("ここには桃もももある。"))
+                .iter()
+                .all(|x| x.original != "こ")
+        );
+        assert!(repeated_function_words(&toks("ごみを捨てて帰る。")).is_empty());
+        assert!(repeated_function_words(&toks("会議では予算について議論した。")).is_empty());
+    }
+
+    #[test]
+    fn apply_finding_replaces_by_char_offsets() {
+        let f = |start, end, r: &str| Finding {
+            start,
+            end,
+            original: String::new(),
+            replacement: r.into(),
+            kind: EditKind::Pattern,
+            delta: 0.0,
+            alternatives: Vec::new(),
+        };
+        assert_eq!(apply_finding("されいる", &f(2, 2, "て")), "されている");
+        assert_eq!(apply_finding("資料をを読む", &f(3, 4, "")), "資料を読む");
+        assert_eq!(apply_finding("利点ある", &f(2, 2, "が")), "利点がある");
+        // 文末への挿入
+        assert_eq!(
+            apply_finding("目的としてい", &f(6, 6, "る")),
+            "目的としている"
+        );
     }
 
     #[test]
