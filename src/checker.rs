@@ -1006,7 +1006,27 @@ impl Checker {
                     "名詞" | "動詞" | "形容詞" | "接頭詞" | "副詞" | "連体詞"
                 );
             let dup = i > 0 && toks[i - 1].surface == t.surface && t.pos != "名詞";
-            if is_simple_particle || is_hira1 || dup {
+            // 空白に接する語は、PDF 由来の改行崩れや見出しの区切りで前後の文脈が切れていることが多く、
+            // n-gram の判定が当てにならない (「使用さ れる」「よ う」)。ここは削除・置換・挿入とも出さない
+            if touches_space(toks, i, i + 1) {
+                continue;
+            }
+            // 「ユーザもベンダも」「AやB」のような並列は、片方を消したり言い換えたりしても文が成立するので
+            // n-gram では誤りに見えやすい。並列の「も」は削除・置換の対象から外す
+            let parallel = is_parallel_mo(toks, i);
+            // 「にも」「については」「ベンダからは」のように、格助詞に係助詞「は」「も」が続く形は
+            // どちらを消しても文が成立するので、n-gram では誤りに見えやすい (契約書の誤検出で多かった)。
+            // 係助詞側と、「からは」「では」「とも」「よりは」の格助詞側を削除の対象から外す。
+            // 「まで」は外さない: 「西口側までは」のように「まで」自体が誤りのことがあり、
+            // その場合は「まで」を消す案 (と「に」への置換案) を出したい
+            let is_kakari =
+                |x: &Token| x.pos == "助詞" && matches!(x.surface.as_str(), "は" | "も");
+            let after_particle = is_kakari(t) && i > 0 && toks[i - 1].pos == "助詞";
+            let before_kakari = is_particle
+                && matches!(t.surface.as_str(), "から" | "で" | "と" | "より")
+                && toks.get(i + 1).is_some_and(is_kakari);
+            let no_delete = after_particle || before_kakari;
+            if (is_simple_particle || is_hira1 || dup) && !parallel && !no_delete {
                 out.push(Cand {
                     a: i,
                     b: i + 1,
@@ -1016,9 +1036,12 @@ impl Checker {
             }
             // 置換元は単純な助詞に限る (「によって」→「に」のような複合助詞の言い換えは正しい文でも高得点になる)。
             // 置換先には法令文で使う複合助詞も含める (「市民税[が]経過措置」→「に関する」)
-            if is_simple_particle {
+            if is_simple_particle && !parallel {
                 for p in PARTICLES.iter().chain(COMPOUND_PARTICLES) {
-                    if *p != t.surface {
+                    // 並列の「や」と「と」はどちらでも正しいので言い換えを出さない
+                    let interchangeable =
+                        matches!((t.surface.as_str(), *p), ("や", "と") | ("と", "や"));
+                    if *p != t.surface && !interchangeable {
                         out.push(Cand {
                             a: i,
                             b: i + 1,
@@ -1051,6 +1074,14 @@ impl Checker {
                     {
                         continue;
                     }
+                    // 「〜であろう」「必要があろう」は推量として正しい。誤りになりやすいのは
+                    // 「多くあろう」のように活用語の直後に「あろう」が続く形なので、直前が助詞か「で」なら出さない
+                    if b > i + 1
+                        && i > 0
+                        && (toks[i - 1].pos == "助詞" || toks[i - 1].surface == "で")
+                    {
+                        continue;
+                    }
                     for f in forms {
                         if b == i + 1 && *f == t.surface {
                             continue;
@@ -1065,7 +1096,10 @@ impl Checker {
                 }
             }
 
+            // 固有名詞 (人名・地名・氏族名) は同音の別表記が正しいことが多く (「加茂」「賀茂」、「一雄」「一夫」)、
+            // 文脈からも決められないので同音異字の対象にしない
             if matches!(t.pos, "名詞" | "動詞" | "形容詞" | "副詞")
+                && t.pos1 != "固有名詞"
                 && !t.reading.is_empty()
                 && let Some(alts) = self.readings.get(t.reading)
             {
@@ -1114,6 +1148,34 @@ impl Checker {
 ///
 /// `keep` で表層形を絞る (言語モデルの語彙に無い語は候補にしても採点できないので、
 /// 読み込み時に落としてメモリを抑える。語彙 1 万語なら 10 分の 1 以下になる)。
+/// toks[a..b] の前後どちらかに、かな・漢字に挟まれた空白があるか。
+/// 「DX は」「第6 条」のような英数字の後ろの空白は Word の文書でも普通に書くので数えない。
+fn touches_space(toks: &[Token], a: usize, b: usize) -> bool {
+    let ja = |c: Option<char>| c.is_some_and(|c| is_kana(c) || is_kanji(c));
+    let gap = |l: &Token, r: &Token| {
+        l.end < r.start && ja(l.surface.chars().last()) && ja(r.surface.chars().next())
+    };
+    (a > 0 && gap(&toks[a - 1], &toks[a])) || (b < toks.len() && gap(&toks[b - 1], &toks[b]))
+}
+
+/// toks[i] が「A も B も」の並列の「も」か (同じ文の近く (前後 6 語以内) に別の「も」がある)。
+fn is_parallel_mo(toks: &[Token], i: usize) -> bool {
+    let is_mo = |t: &Token| t.surface == "も" && t.pos == "助詞";
+    if !is_mo(&toks[i]) {
+        return false;
+    }
+    let lo = i.saturating_sub(6);
+    let hi = (i + 7).min(toks.len());
+    (lo..hi).any(|j| {
+        j != i
+            && is_mo(&toks[j])
+            // 間に句点・読点を挟むものは別の節なので並列とはみなさない
+            && !toks[j.min(i)..j.max(i)]
+                .iter()
+                .any(|t| matches!(t.surface.as_str(), "。" | "、"))
+    })
+}
+
 pub fn load_inflections(
     path: &std::path::Path,
     keep: &dyn Fn(&str) -> bool,
@@ -1164,4 +1226,103 @@ pub fn load_readings(
     }
     m.shrink_to_fit();
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(s: &str) -> Vec<Token> {
+        Tokenizer::new()
+            .expect("辞書 (data/ipadic.dic) が必要")
+            .tokenize(s)
+    }
+
+    fn index_of(t: &[Token], surface: &str, nth: usize) -> usize {
+        t.iter()
+            .enumerate()
+            .filter(|(_, x)| x.surface == surface)
+            .nth(nth)
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    #[test]
+    fn mo_in_parallel_phrase_is_parallel() {
+        let t = toks("ユーザもベンダも責任を負う。");
+        assert!(is_parallel_mo(&t, index_of(&t, "も", 0)));
+        assert!(is_parallel_mo(&t, index_of(&t, "も", 1)));
+    }
+
+    #[test]
+    fn single_mo_is_not_parallel() {
+        let t = toks("ベンダも責任を負う。");
+        assert!(!is_parallel_mo(&t, index_of(&t, "も", 0)));
+        // 読点を挟んだ別の節の「も」は並列ではない
+        let t = toks("ユーザも、ベンダも責任を負う。");
+        assert!(!is_parallel_mo(&t, index_of(&t, "も", 0)));
+    }
+
+    /// 候補生成だけを見るための最小の Checker (言語モデルは 1 文から作る)。
+    fn tiny_checker() -> anyhow::Result<Checker> {
+        let dir = std::env::temp_dir().join(format!("celso-checker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let corpus = dir.join("corpus.txt");
+        std::fs::write(&corpus, "宿泊 施設 が ある 。\n")?;
+        let lm = crate::lm::build(
+            &[&corpus],
+            &crate::lm::BuildConfig {
+                order: 3,
+                min_word_count: 1,
+                min_count: [1; crate::lm::MAX_ORDER],
+                vocab: None,
+                keep_words: None,
+                keep_min_count: [1; crate::lm::MAX_ORDER],
+            },
+        )?;
+        Ok(Checker::new(
+            Tokenizer::new()?,
+            Box::new(lm),
+            Config::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        ))
+    }
+
+    fn has_delete(c: &Checker, t: &[Token], surface: &str) -> bool {
+        let i = index_of(t, surface, 0);
+        c.candidates(t)
+            .iter()
+            .any(|x| x.a == i && x.b == i + 1 && x.kind == EditKind::Delete)
+    }
+
+    #[test]
+    fn kakari_after_case_particle_is_not_deleted() {
+        let Ok(c) = tiny_checker() else { return };
+        let t = toks("瑕疵についてもベンダは責任を負う。");
+        assert!(!has_delete(&c, &t, "も"));
+        let t = toks("ベンダからは回答がない。");
+        assert!(!has_delete(&c, &t, "から"));
+        assert!(!has_delete(&c, &t, "は"));
+        // 「西口側までは」の「まで」は消す候補に残す
+        let t = toks("西口側までは宿泊施設がある。");
+        assert!(has_delete(&c, &t, "まで"));
+        // 名詞の直後の余計な「は」は従来どおり削除候補にする (「飲食は店」)
+        let t = toks("飲食は店がある。");
+        assert!(has_delete(&c, &t, "は"));
+    }
+
+    #[test]
+    fn edit_next_to_space_touches_space() {
+        let t = toks("使用さ れる画面");
+        let i = index_of(&t, "さ", 0);
+        assert!(touches_space(&t, i, i + 1));
+        let t = toks("使用される画面");
+        let i = index_of(&t, "さ", 0);
+        assert!(!touches_space(&t, i, i + 1));
+        // 英字の後ろの空白は Word の文書でも普通なので対象外
+        let t = toks("IPA から具体的対策が");
+        let i = index_of(&t, "から", 0);
+        assert!(!touches_space(&t, i, i + 1));
+    }
 }
