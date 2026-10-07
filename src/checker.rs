@@ -1147,11 +1147,52 @@ impl Checker {
 ///
 /// `keep` で表層形を絞る (言語モデルの語彙に無い語は候補にしても採点できないので、
 /// 読み込み時に落としてメモリを抑える。語彙 1 万語なら 10 分の 1 以下になる)。
-/// 同音の 2 語の漢字部分が、表記ゆれの関係 (同じ漢字・交ぜ書き・送り仮名違い) か。
+/// 意味が同じで、どちらの表記も許容される同音の組 (漢字部分)。
+///
+/// 誤変換ではなく表記の選び方なので、同音異字の候補にしない (表記の統一は用字用語・表記ゆれの機能が担う)。
+/// 「生」「活」のように漢字 1 字の組は、同じ読みの語どうし (生かす/活かす) にだけ効く。
+/// 意味の違う異字同訓 (追求/追及、意思/意志、配布/配付、超える/越える など) は入れない。
+const NOTATION_VARIANTS: &[(&str, &str)] = &[
+    ("交代", "交替"),
+    ("稼動", "稼働"),
+    ("充分", "十分"),
+    ("係", "関"),
+    ("拘", "関"),
+    ("名字", "苗字"),
+    ("収集", "蒐集"),
+    ("回", "廻"),
+    ("付則", "附則"),
+    ("付記", "附記"),
+    ("付属", "附属"),
+    ("付帯", "附帯"),
+    ("寄付", "寄附"),
+    ("付置", "附置"),
+    ("関数", "函数"),
+    ("侵食", "浸食"),
+    ("賞賛", "称賛"),
+    ("摩耗", "磨耗"),
+    ("機運", "気運"),
+    ("生", "活"),
+    ("広", "拡"),
+    ("撹乱", "攪乱"),
+    ("車両", "車輛"),
+    ("車両", "車輌"),
+    ("車輛", "車輌"),
+    ("木曽", "木曾"),
+    ("陰", "蔭"),
+];
+
+fn is_listed_variant(a: &str, b: &str) -> bool {
+    NOTATION_VARIANTS
+        .iter()
+        .any(|&(x, y)| (a == x && b == y) || (a == y && b == x))
+}
+
+/// 同音の 2 語の漢字部分が、表記ゆれの関係 (同じ漢字・交ぜ書き・送り仮名違い・許容表記の組) か。
 /// 「あん分」⇔「按分」「漏えい」⇔「漏洩」のように一方の漢字が他方に含まれるものは、
 /// 誤変換ではなく表記の選び方なので同音異字の候補にしない。
-fn is_notation_variant(a: &str, b: &str) -> bool {
-    a.chars().all(|c| b.contains(c)) || b.chars().all(|c| a.contains(c))
+pub fn is_notation_variant(a: &str, b: &str) -> bool {
+    a.chars().all(|c| b.contains(c)) || b.chars().all(|c| a.contains(c)) || is_listed_variant(a, b)
 }
 
 /// toks[a..b] の前後どちらかに、かな・漢字に挟まれた空白があるか。
@@ -1324,8 +1365,17 @@ mod tests {
         assert!(is_notation_variant("漏洩", "漏"));
         assert!(is_notation_variant("当", "当"));
         assert!(!is_notation_variant("改訂", "改定"));
-        assert!(!is_notation_variant("付則", "附則"));
         assert!(!is_notation_variant("追求", "追及"));
+    }
+
+    #[test]
+    fn listed_synonymous_spellings_are_notation_variants() {
+        assert!(is_notation_variant("交代", "交替"));
+        assert!(is_notation_variant("稼働", "稼動"));
+        assert!(is_notation_variant("生", "活"));
+        // 意味の違う異字同訓は誤変換として扱う
+        assert!(!is_notation_variant("意思", "意志"));
+        assert!(!is_notation_variant("配布", "配付"));
     }
 
     #[test]

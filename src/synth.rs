@@ -187,9 +187,7 @@ pub fn corrupt_homophone(
             .take(12)
             .filter(|(a, c)| {
                 let (x, y) = (kanji_of(a), kanji_of(&t.surface));
-                *a != t.surface
-                    && *c >= 20
-                    && !(x.chars().all(|ch| y.contains(ch)) || y.chars().all(|ch| x.contains(ch)))
+                *a != t.surface && *c >= 20 && !crate::checker::is_notation_variant(&x, &y)
             })
             .map(|(a, _)| a.clone())
             .collect()
