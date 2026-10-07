@@ -708,6 +708,7 @@ mod tests {
                 order: 3,
                 min_word_count: 1,
                 min_count: [1; MAX_ORDER],
+                vocab: None,
             },
         )
         .unwrap();
