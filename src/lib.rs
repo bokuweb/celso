@@ -1,4 +1,5 @@
 pub mod checker;
+pub mod cooc;
 pub mod lm;
 pub mod mlm;
 pub mod ngset;

@@ -57,9 +57,12 @@ cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
 # 7. 語彙 1 万語 + 品詞クラス、3-gram、強い足切りで配布用モデル (約 13MB) を作る
 $BIN vocab --size 10000 -o data/vocab10k.txt data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
 #    誤変換の候補にする同音異字の語を足す (約 5 千語、+0.7MB)
-python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv > data/vocab.txt
+python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv data/homo_words.txt > data/vocab.txt
 $BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin \
   data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
-# 8. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
+# 8. 同音異字の判定に使う文内共起モデル (約 1.7MB)
+$BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt -o data/cooc.bin \
+  data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+# 9. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
-cp data/model.bin data/dist/model.bin
+cp data/model.bin data/cooc.bin data/dist/

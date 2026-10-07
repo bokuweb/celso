@@ -130,6 +130,8 @@ pub struct Config {
     pub novelty_order: usize,
     /// 指摘箇所の前後を含む文字列が文書内にこの回数以上あれば指摘しない (0 で無効)。
     pub doc_repeat_limit: usize,
+    /// 同音異字の候補に足す共起の差の重み (log10 換算の Δ に、PMI 差 × 重み / ln10 を足す)。
+    pub cooc_weight: f32,
     /// MLM の重み (最終スコア = n-gram Δ + mlm_weight × MLM Δ)。
     pub mlm_weight: f32,
     /// MLM 併用時、1 段目は閾値からこの幅だけ下の候補まで残して 2 段目に回す。
@@ -181,6 +183,7 @@ impl Default for Config {
             novelty_order: 3,
             doc_repeat_limit: 2,
             mlm_weight: 1.0,
+            cooc_weight: 1.0,
             stage1_slack: 1.5,
             top_k: 4,
             mlm_margin: 1,
@@ -239,6 +242,8 @@ pub struct Checker {
     readings: FxHashMap<String, Vec<(String, u32)>>,
     /// 2 段目のマスク言語モデル (無ければ n-gram だけで判定)
     mlm: Option<Mlm>,
+    /// 同音異字の判定に使う文内共起モデル (無ければ n-gram だけで判定)
+    cooc: Option<crate::cooc::Cooc>,
     /// 文単位の結果キャッシュ (正規化済みの文のハッシュ → その文の指摘)。
     /// 指摘は文の中身だけで決まる (文書内繰り返しの抑制は文書全体で毎回かけ直す) ので、
     /// 編集されていない文は再計算しなくてよい。
@@ -279,8 +284,15 @@ impl Checker {
             inflections,
             readings,
             mlm: None,
+            cooc: None,
             cache: None,
         }
+    }
+
+    /// 同音異字の判定に文内共起モデルを使う。
+    pub fn with_cooc(mut self, cooc: crate::cooc::Cooc) -> Self {
+        self.cooc = Some(cooc);
+        self
     }
 
     /// 文単位の結果キャッシュを有効にする (2 回目以降の検査で、変わっていない文を再計算しない)。
@@ -449,6 +461,7 @@ impl Checker {
         let mut repl_buf = [0u32; 1];
         // 未出現ゲートの判定は語の位置ごとに 1 回だけ行い、候補間で使い回す
         let novel = self.novel_positions(&ids);
+        let mut cooc_ctx: Option<Vec<u32>> = None;
         for c in self.candidates(&toks) {
             let repl_ids: &[u32] = match c.repl {
                 None => &[],
@@ -464,7 +477,21 @@ impl Checker {
             if !th.is_finite() || !Self::is_novel(&ids, &novel, c.a + 1, c.b + 1) {
                 continue;
             }
-            let delta = self.delta(&ids, c.a + 1, c.b + 1, repl_ids, &mut buf);
+            let mut delta = self.delta(&ids, c.a + 1, c.b + 1, repl_ids, &mut buf);
+            // 同音異字は文全体の語との相性も足す (n-gram の前後 2 語だけでは決まらないため)
+            if c.kind == EditKind::Homophone
+                && let Some(cooc) = &self.cooc
+            {
+                let ctx = cooc_ctx.get_or_insert_with(|| {
+                    crate::cooc::context_ids(
+                        self.lm.as_ref(),
+                        toks.iter().map(|t| t.surface.as_str()),
+                    )
+                });
+                let orig = self.lm.word_id(toks[c.a].key());
+                let diff = cooc.score(repl_ids[0], ctx) - cooc.score(orig, ctx);
+                delta += self.cfg.cooc_weight * diff / std::f32::consts::LN_10;
+            }
             if delta >= th {
                 let start = toks
                     .get(c.a)

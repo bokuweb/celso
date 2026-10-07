@@ -57,6 +57,11 @@ enum Cmd {
         /// 語彙ファイル (--with-class で分かち書きしたコーパス用)。語彙外の語は品詞クラスにする
         #[arg(long)]
         vocab: Option<PathBuf>,
+        /// この語を含む n-gram は --keep-min-count で足切りする (同音異字の語など)
+        #[arg(long)]
+        keep_words: Option<PathBuf>,
+        #[arg(long, default_value = "1,2,3,3,3")]
+        keep_min_count: String,
         #[arg(long, default_value_t = 2)]
         min_word_count: u32,
         /// 次数ごとの足切り (カンマ区切り, 1-gram から)
@@ -82,6 +87,23 @@ enum Cmd {
         min_word_count: u32,
         #[arg(long, default_value = "1,2,2,2,2")]
         min_count: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        inputs: Vec<PathBuf>,
+    },
+    /// 同音異字の判定に使う文内共起モデルを作る。
+    BuildCooc {
+        #[arg(long, default_value = "data/model.bin")]
+        model: PathBuf,
+        #[arg(long)]
+        vocab: Option<PathBuf>,
+        /// 同音異字の組になる語の一覧
+        #[arg(long)]
+        homophones: PathBuf,
+        #[arg(long, default_value_t = 64)]
+        top_k: usize,
+        #[arg(long, default_value_t = 5)]
+        min_pair: u32,
         #[arg(short, long)]
         output: PathBuf,
         inputs: Vec<PathBuf>,
@@ -158,6 +180,11 @@ struct ModelArgs {
     /// 2 段目のマスク言語モデル (HuggingFace 形式のディレクトリ)。"none" で無効
     #[arg(long, default_value = "none")]
     mlm: String,
+    /// 同音異字の判定に使う文内共起モデル (無ければ使わない)
+    #[arg(long, default_value = "data/cooc.bin")]
+    cooc: PathBuf,
+    #[arg(long, default_value_t = 1.0)]
+    cooc_weight: f32,
     /// 最終スコア = n-gram Δ + mlm_weight × MLM Δ
     #[arg(long, default_value_t = 1.0)]
     mlm_weight: f32,
@@ -215,6 +242,7 @@ impl ModelArgs {
             self.doc_repeat
         };
         cfg.mlm_weight = self.mlm_weight;
+        cfg.cooc_weight = self.cooc_weight;
         cfg.stage1_slack = self.stage1_slack;
         cfg.mlm_length_penalty = self.length_penalty;
         cfg.mlm_band = self.mlm_band;
@@ -242,6 +270,11 @@ impl ModelArgs {
             lm.vocab_len()
         );
         let checker = Checker::new(Tokenizer::new()?, lm, self.config(), infl, readings);
+        let checker = if self.cooc.exists() {
+            checker.with_cooc(celso::cooc::Cooc::load(&self.cooc)?)
+        } else {
+            checker
+        };
         let mlm_dir = PathBuf::from(&self.mlm);
         if self.mlm != "none" && mlm_dir.join("model.safetensors").exists() {
             eprintln!("mlm: {mlm_dir:?}");
@@ -263,6 +296,35 @@ const ALL_KINDS: [EditKind; 6] = [
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::BuildCooc {
+            model,
+            vocab,
+            homophones,
+            top_k,
+            min_pair,
+            output,
+            inputs,
+        } => {
+            let lm = lm::Model::load(&model)?;
+            let vocab: Option<rustc_hash::FxHashSet<String>> = match vocab {
+                Some(p) => Some(
+                    std::fs::read_to_string(p)?
+                        .lines()
+                        .map(String::from)
+                        .collect(),
+                ),
+                None => None,
+            };
+            let h: rustc_hash::FxHashSet<String> = std::fs::read_to_string(homophones)?
+                .lines()
+                .map(String::from)
+                .collect();
+            let t = Instant::now();
+            let c = celso::cooc::build(&inputs, &lm, vocab.as_ref(), &h, top_k, min_pair)?;
+            c.save(&output)?;
+            eprintln!("built in {:.1?}", t.elapsed());
+            Ok(())
+        }
         Cmd::PruneTables { m, out_dir } => {
             let lm = lm::Model::load(&m.model)?;
             std::fs::create_dir_all(&out_dir)?;
@@ -386,6 +448,8 @@ fn main() -> Result<()> {
         Cmd::BuildLm {
             order,
             vocab,
+            keep_words,
+            keep_min_count,
             min_word_count,
             min_count,
             output,
@@ -405,6 +469,19 @@ fn main() -> Result<()> {
                 ),
                 None => None,
             };
+            let mut kmc = [1u32; MAX_ORDER];
+            for (i, v) in keep_min_count.split(',').enumerate().take(MAX_ORDER) {
+                kmc[i] = v.parse()?;
+            }
+            let keep_words = match keep_words {
+                Some(p) => Some(
+                    std::fs::read_to_string(p)?
+                        .lines()
+                        .map(String::from)
+                        .collect(),
+                ),
+                None => None,
+            };
             let m = lm::build(
                 &inputs,
                 &BuildConfig {
@@ -412,6 +489,8 @@ fn main() -> Result<()> {
                     min_word_count,
                     min_count: mc,
                     vocab,
+                    keep_words,
+                    keep_min_count: kmc,
                 },
             )?;
             m.save(&output)?;

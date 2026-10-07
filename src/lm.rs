@@ -393,6 +393,9 @@ pub struct BuildConfig {
     pub min_count: [u32; MAX_ORDER],
     /// 語彙。コーパスのトークンが「表層形\x1f品詞クラス」のとき、語彙外の表層形は品詞クラスにする。
     pub vocab: Option<rustc_hash::FxHashSet<String>>,
+    /// この語を含む n-gram は `keep_min_count` で足切りする (同音異字の語の文脈を残すため)。
+    pub keep_words: Option<rustc_hash::FxHashSet<String>>,
+    pub keep_min_count: [u32; MAX_ORDER],
 }
 
 /// コーパスの 1 トークンを、語彙に応じて表層形か品詞クラスにする。
@@ -548,12 +551,36 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
     };
 
     // --- 足切り後に残す n-gram ---
+    // keep_words を含む n-gram は緩い足切り (誤変換の判定に効く文脈を残す)
+    let keep_ids: rustc_hash::FxHashSet<u32> = cfg
+        .keep_words
+        .iter()
+        .flatten()
+        .filter_map(|w| vocab.get(w.as_str()).copied())
+        .collect();
+    let has_keep = |k: u128| -> bool {
+        if keep_ids.is_empty() {
+            return false;
+        }
+        let n = unpack_len(k);
+        let body = strip_order(k);
+        unpack_ids(body, n)[..n]
+            .iter()
+            .any(|id| keep_ids.contains(id))
+    };
     let keep: Vec<Vec<bool>> = raw
         .iter()
         .enumerate()
         .map(|(i, t)| {
             t.iter()
-                .map(|(k, c)| *c >= cfg.min_count[i] || (i == 0) || unpack_len(*k) == 0)
+                .map(|(k, c)| {
+                    let th = if has_keep(*k) {
+                        cfg.keep_min_count[i]
+                    } else {
+                        cfg.min_count[i]
+                    };
+                    *c >= th || (i == 0) || unpack_len(*k) == 0
+                })
                 .collect()
         })
         .collect();
@@ -714,6 +741,8 @@ mod tests {
                 min_word_count: 1,
                 min_count: [1; MAX_ORDER],
                 vocab: None,
+                keep_words: None,
+                keep_min_count: [1; MAX_ORDER],
             },
         )
         .unwrap();
