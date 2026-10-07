@@ -75,7 +75,7 @@ impl Cooc {
             // 行は共起語 ID の昇順
             let (mut lo, mut hi) = (0usize, len as usize);
             while lo < hi {
-                let mid = (lo + hi) / 2;
+                let mid = lo.midpoint(hi);
                 match id_at(mid).cmp(&w) {
                     std::cmp::Ordering::Less => lo = mid + 1,
                     std::cmp::Ordering::Greater => hi = mid,
@@ -115,6 +115,7 @@ impl Cooc {
     }
 
     /// 文中の語のうち、共起の手がかりにする語の ID (昇順・重複なし)。
+    #[must_use]
     pub fn context(
         &self,
         lm: &dyn LanguageModel,
@@ -238,6 +239,7 @@ pub struct Stats {
 ///
 /// `ctx_words` を渡すと、手がかりの語をその語彙 (漢字を含む語だけ使う) で数える。
 /// 空なら言語モデルの語彙で数える。
+#[allow(clippy::implicit_hasher)] // crate 内では常に FxHashSet を渡す
 pub fn count(
     paths: &[impl AsRef<Path>],
     lm: &dyn LanguageModel,
@@ -366,34 +368,44 @@ impl Stats {
         if b.len() < 16 || &b[..8] != b"CELSOCS2" {
             bail!("not a celso co-occurrence stats file (CELSOCS2)");
         }
-        let u64_at = |p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
-        let u32_at = |p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
-        let nsent = u64_at(8);
+        let truncated = || anyhow::anyhow!("truncated co-occurrence stats file");
+        let u64_at = |p: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                b.get(p..p + 8).ok_or_else(truncated)?.try_into()?,
+            ))
+        };
+        let u32_at = |p: usize| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                b.get(p..p + 4).ok_or_else(truncated)?.try_into()?,
+            ))
+        };
+        let nsent = u64_at(8)?;
         let mut p = 16;
         let mut maps = [FxHashMap::default(), FxHashMap::default()];
         for m in &mut maps {
-            let n = u64_at(p) as usize;
+            let n = usize::try_from(u64_at(p)?)?;
             p += 8;
             m.reserve(n);
             for _ in 0..n {
-                m.insert(u32_at(p), u32_at(p + 4));
+                m.insert(u32_at(p)?, u32_at(p + 4)?);
                 p += 8;
             }
         }
         let [heads, ctx] = maps;
-        let nw = u64_at(p) as usize;
+        let nw = usize::try_from(u64_at(p)?)?;
         p += 8;
         let mut ctx_words = Vec::with_capacity(nw);
         for _ in 0..nw {
-            let len = b[p] as usize;
-            ctx_words.push(std::str::from_utf8(&b[p + 1..p + 1 + len])?.to_string());
+            let len = *b.get(p).ok_or_else(truncated)? as usize;
+            let w = b.get(p + 1..p + 1 + len).ok_or_else(truncated)?;
+            ctx_words.push(std::str::from_utf8(w)?.to_string());
             p += 1 + len;
         }
-        let np = u64_at(p) as usize;
+        let np = usize::try_from(u64_at(p)?)?;
         p += 8;
         let mut pairs = Vec::with_capacity(np);
         for _ in 0..np {
-            pairs.push((u32_at(p), u32_at(p + 4), u32_at(p + 8)));
+            pairs.push((u32_at(p)?, u32_at(p + 4)?, u32_at(p + 8)?));
             p += 12;
         }
         Ok(Self {
@@ -441,6 +453,7 @@ impl Stats {
 }
 
 /// 分かち書き済みコーパス (`--with-class` 形式) から作る (PMI 上位 `top_k` 語)。
+#[allow(clippy::implicit_hasher)] // crate 内では常に FxHashSet を渡す
 pub fn build(
     paths: &[impl AsRef<Path>],
     lm: &dyn LanguageModel,

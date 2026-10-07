@@ -158,6 +158,7 @@ pub fn corrupt(
 ///
 /// 検査側の修正候補と同じ条件 (2 文字以上で漢字を含む内容語、固有名詞を除く、
 /// 漢字の違う同音語で出現数 20 以上・上位 12 語以内) の語だけを対象にする。
+#[allow(clippy::implicit_hasher)] // crate 内では常に FxHashMap を渡す
 pub fn corrupt_homophone(
     tok: &Tokenizer,
     clean: &str,
