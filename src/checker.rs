@@ -525,13 +525,12 @@ impl Checker {
                 && let Some(cooc) = &self.cooc
             {
                 let ctx = cooc_ctx.get_or_insert_with(|| {
-                    crate::cooc::context_ids(
-                        self.lm.as_ref(),
-                        toks.iter().map(|t| t.surface.as_str()),
-                    )
+                    cooc.context(self.lm.as_ref(), toks.iter().map(|t| t.surface.as_str()))
                 });
                 let orig = self.lm.word_id(toks[c.a].key());
-                let diff = cooc.score(repl_ids[0], ctx) - cooc.score(orig, ctx);
+                // 置き換える元の語そのものは手がかりに数えない
+                let skip = cooc.ctx_id(self.lm.as_ref(), &toks[c.a].surface);
+                let diff = cooc.score(repl_ids[0], ctx, skip) - cooc.score(orig, ctx, skip);
                 delta += self.cfg.cooc_weight * diff / std::f32::consts::LN_10;
             }
             if delta >= th {
@@ -1112,7 +1111,7 @@ impl Checker {
                         && *cnt >= 20
                         && t.surface.chars().count() >= 2
                         && !orig_kanji.is_empty()
-                        && kanji_of(alt) != orig_kanji
+                        && !is_notation_variant(&orig_kanji, &kanji_of(alt))
                     {
                         out.push(Cand {
                             a: i,
@@ -1148,6 +1147,13 @@ impl Checker {
 ///
 /// `keep` で表層形を絞る (言語モデルの語彙に無い語は候補にしても採点できないので、
 /// 読み込み時に落としてメモリを抑える。語彙 1 万語なら 10 分の 1 以下になる)。
+/// 同音の 2 語の漢字部分が、表記ゆれの関係 (同じ漢字・交ぜ書き・送り仮名違い) か。
+/// 「あん分」⇔「按分」「漏えい」⇔「漏洩」のように一方の漢字が他方に含まれるものは、
+/// 誤変換ではなく表記の選び方なので同音異字の候補にしない。
+fn is_notation_variant(a: &str, b: &str) -> bool {
+    a.chars().all(|c| b.contains(c)) || b.chars().all(|c| a.contains(c))
+}
+
 /// toks[a..b] の前後どちらかに、かな・漢字に挟まれた空白があるか。
 /// 「DX は」「第6 条」のような英数字の後ろの空白は Word の文書でも普通に書くので数えない。
 fn touches_space(toks: &[Token], a: usize, b: usize) -> bool {
@@ -1310,6 +1316,16 @@ mod tests {
         // 名詞の直後の余計な「は」は従来どおり削除候補にする (「飲食は店」)
         let t = toks("飲食は店がある。");
         assert!(has_delete(&c, &t, "は"));
+    }
+
+    #[test]
+    fn mixed_kana_spelling_is_notation_variant() {
+        assert!(is_notation_variant("分", "按分"));
+        assert!(is_notation_variant("漏洩", "漏"));
+        assert!(is_notation_variant("当", "当"));
+        assert!(!is_notation_variant("改訂", "改定"));
+        assert!(!is_notation_variant("付則", "附則"));
+        assert!(!is_notation_variant("追求", "追及"));
     }
 
     #[test]

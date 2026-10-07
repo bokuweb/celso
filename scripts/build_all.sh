@@ -76,8 +76,12 @@ $BIN vocab --size 10000 -o data/vocab10k.txt "${INPUTS[@]}"
 #    誤変換の候補にする同音異字の語を足す (約 5 千語、+0.7MB)
 python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv data/homo_words.txt > data/vocab.txt
 $BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin "${INPUTS[@]}"
-# 8. 同音異字の判定に使う文内共起モデル (約 1.7MB)
-$BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt -o data/cooc.bin "${INPUTS[@]}"
+# 8. 同音異字の判定に使う文内共起モデル (約 3.7MB)。手がかりの語は頻出 5 万語から選ぶ。
+#    集計 (data/cooc_stats.bin) を残しておくと、--top-k などを変えて作り直すときにコーパスを数え直さない
+$BIN vocab --size 50000 -o data/vocab50k.txt "${INPUTS[@]}"
+$BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt \
+  --ctx-vocab data/vocab50k.txt --stats data/cooc_stats.bin --top-k 128 --min-pair 3 --weight-by-count \
+  -o data/cooc.bin "${INPUTS[@]}"
 # 9. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
 cp data/model.bin data/cooc.bin data/dist/

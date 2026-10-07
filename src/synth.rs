@@ -153,3 +153,61 @@ pub fn corrupt(
         EditKind::Homophone | EditKind::Char => None,
     }
 }
+
+/// 同音異字の誤変換を入れる (「対象」→「対照」)。直しは元の語へ戻す。
+///
+/// 検査側の修正候補と同じ条件 (2 文字以上で漢字を含む内容語、固有名詞を除く、
+/// 漢字の違う同音語で出現数 20 以上・上位 12 語以内) の語だけを対象にする。
+pub fn corrupt_homophone(
+    tok: &Tokenizer,
+    clean: &str,
+    readings: &FxHashMap<String, Vec<(String, u32)>>,
+    rng: &mut Rng,
+) -> Option<Example> {
+    let toks: Vec<Token> = tok.tokenize(clean);
+    let chars: Vec<char> = clean.chars().collect();
+    let kanji_of = |w: &str| {
+        w.chars()
+            .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c) || *c == '々')
+            .collect::<String>()
+    };
+    let alts_of = |t: &Token| -> Vec<String> {
+        if !matches!(t.pos, "名詞" | "動詞" | "形容詞" | "副詞")
+            || t.pos1 == "固有名詞"
+            || t.surface.chars().count() < 2
+            || kanji_of(&t.surface).is_empty()
+        {
+            return Vec::new();
+        }
+        let Some(alts) = readings.get(t.reading) else {
+            return Vec::new();
+        };
+        alts.iter()
+            .take(12)
+            .filter(|(a, c)| {
+                let (x, y) = (kanji_of(a), kanji_of(&t.surface));
+                *a != t.surface
+                    && *c >= 20
+                    && !(x.chars().all(|ch| y.contains(ch)) || y.chars().all(|ch| x.contains(ch)))
+            })
+            .map(|(a, _)| a.clone())
+            .collect()
+    };
+    let idx: Vec<usize> = (0..toks.len())
+        .filter(|&i| !alts_of(&toks[i]).is_empty())
+        .collect();
+    if idx.is_empty() {
+        return None;
+    }
+    let i = idx[rng.below(idx.len())];
+    let alts = alts_of(&toks[i]);
+    let a = &alts[rng.below(alts.len())];
+    Some(Example {
+        clean: clean.into(),
+        text: splice(&chars, toks[i].start, toks[i].end, a),
+        gold_start: toks[i].start,
+        gold_end: toks[i].start + a.chars().count(),
+        gold_repl: toks[i].surface.clone(),
+        kind: EditKind::Homophone,
+    })
+}

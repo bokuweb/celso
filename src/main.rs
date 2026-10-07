@@ -106,6 +106,15 @@ enum Cmd {
         min_pair: u32,
         #[arg(short, long)]
         output: PathBuf,
+        /// 共起の集計の保存先。あれば読み込んでコーパスを数え直さない
+        #[arg(long)]
+        stats: Option<PathBuf>,
+        /// 手がかりにする語の語彙 (1 行 1 語、漢字を含む語だけ使う)。省略時は言語モデルの語彙
+        #[arg(long)]
+        ctx_vocab: Option<PathBuf>,
+        /// 共起語を「共起回数 × PMI」の大きい順に選ぶ (既定は PMI の大きい順)
+        #[arg(long)]
+        weight_by_count: bool,
         inputs: Vec<PathBuf>,
     },
     /// 活用表・同音異字表を、モデルの語彙にある語だけへ絞って書き出す (配布用)。
@@ -315,6 +324,9 @@ fn main() -> Result<()> {
             top_k,
             min_pair,
             output,
+            stats,
+            ctx_vocab,
+            weight_by_count,
             inputs,
         } => {
             let lm = lm::Model::load(&model)?;
@@ -332,7 +344,38 @@ fn main() -> Result<()> {
                 .map(String::from)
                 .collect();
             let t = Instant::now();
-            let c = celso::cooc::build(&inputs, &lm, vocab.as_ref(), &h, top_k, min_pair)?;
+            let ctx_words: Vec<String> = match &ctx_vocab {
+                Some(p) => std::fs::read_to_string(p)?
+                    .lines()
+                    .map(String::from)
+                    .collect(),
+                None => Vec::new(),
+            };
+            let st = match &stats {
+                Some(p) if p.exists() => celso::cooc::Stats::load(p)?,
+                _ => {
+                    // 選び直せるように少し低めの回数まで残して数える
+                    let st = celso::cooc::count(
+                        &inputs,
+                        &lm,
+                        vocab.as_ref(),
+                        &h,
+                        &ctx_words,
+                        min_pair.min(3),
+                    )?;
+                    if let Some(p) = &stats {
+                        st.save(p)?;
+                    }
+                    st
+                }
+            };
+            eprintln!(
+                "stats ready in {:.1?} ({} pairs, {} context words)",
+                t.elapsed(),
+                st.pairs.len(),
+                st.ctx_words.len()
+            );
+            let c = st.select_pmi(top_k, min_pair, weight_by_count)?;
             c.save(&output)?;
             eprintln!("built in {:.1?}", t.elapsed());
             Ok(())
@@ -709,11 +752,16 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
     }
     let infl = load_inflections(&m.inflections, &|_| true)?;
     let mut rng = Rng::new(seed);
+    let readings = {
+        let lm = checker.lm.as_ref();
+        load_readings(&m.readings, &|w: &str| lm.word_id(w) != celso::lm::UNK)?
+    };
     let kinds = [
         EditKind::Delete,
         EditKind::Substitute,
         EditKind::Inflection,
         EditKind::Insert,
+        EditKind::Homophone,
     ];
     let mut examples = Vec::new();
     for k in kinds {
@@ -722,7 +770,12 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
         while made < n && tries < n * 20 {
             tries += 1;
             let s = &sents[rng.below(sents.len())];
-            if let Some(e) = corrupt(&checker.tok, s, k, &infl, &mut rng) {
+            let e = if k == EditKind::Homophone {
+                celso::synth::corrupt_homophone(&checker.tok, s, &readings, &mut rng)
+            } else {
+                corrupt(&checker.tok, s, k, &infl, &mut rng)
+            };
+            if let Some(e) = e {
                 examples.push(e);
                 made += 1;
             }
