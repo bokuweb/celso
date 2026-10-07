@@ -1191,6 +1191,7 @@ fn is_listed_variant(a: &str, b: &str) -> bool {
 /// 同音の 2 語の漢字部分が、表記ゆれの関係 (同じ漢字・交ぜ書き・送り仮名違い・許容表記の組) か。
 /// 「あん分」⇔「按分」「漏えい」⇔「漏洩」のように一方の漢字が他方に含まれるものは、
 /// 誤変換ではなく表記の選び方なので同音異字の候補にしない。
+#[must_use]
 pub fn is_notation_variant(a: &str, b: &str) -> bool {
     a.chars().all(|c| b.contains(c)) || b.chars().all(|c| a.contains(c)) || is_listed_variant(a, b)
 }
