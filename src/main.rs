@@ -162,7 +162,10 @@ struct ModelArgs {
     /// 一般文向けの閾値 (同じ並び)。法令文らしくない文書に使う
     #[arg(long, default_value = "4.5,5.5,3,4,4.5,inf")]
     general_thresholds: String,
-    /// 文書の種類を固定する (legal / general)。省略時は文書ごとに自動判定
+    /// 契約書向けの閾値 (同じ並び)
+    #[arg(long, default_value = "5,6,3.5,4.5,5,inf")]
+    contract_thresholds: String,
+    /// 文書の種類を固定する (legal / general / contract)。省略時は文書ごとに自動判定
     #[arg(long)]
     domain: Option<String>,
     /// 法令文向けの閾値 (log10): delete,substitute,inflection,insert,homophone,char (inf で無効)
@@ -229,9 +232,18 @@ impl ModelArgs {
         for (k, t) in ALL_KINDS.into_iter().zip(g) {
             cfg.general_thresholds.insert(k, t);
         }
+        let ct: Vec<f32> = self
+            .contract_thresholds
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        for (k, t) in ALL_KINDS.into_iter().zip(ct) {
+            cfg.contract_thresholds.insert(k, t);
+        }
         cfg.domain = match self.domain.as_deref() {
             Some("legal") => Some(celso::checker::Domain::Legal),
             Some("general") => Some(celso::checker::Domain::General),
+            Some("contract") => Some(celso::checker::Domain::Contract),
             _ => None,
         };
         cfg.enable_insert = !self.no_insert;

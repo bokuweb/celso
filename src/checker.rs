@@ -74,6 +74,8 @@ pub struct Suggestion {
 pub enum Domain {
     Legal,
     General,
+    /// 契約書 (モデル契約の解説文を含む)。法令文より言い回しが多様で、一般文より法令用語が多い
+    Contract,
 }
 
 /// 法令文らしさで文書の種類を推定する。条・項・号の参照や法令用語が 1,000 字あたり 2 回以上なら法令文。
@@ -109,7 +111,27 @@ pub fn detect_domain(text: &str) -> Domain {
             }
         }
     }
-    if hits * 1000 >= chars * 2 {
+    // 契約書らしさ: 当事者の呼び方と「本契約」。条番号や法令用語もあるので、法令文より先に判定する
+    let mut contract = 0usize;
+    for pat in [
+        "甲",
+        "乙",
+        "本契約",
+        "委託者",
+        "受託者",
+        "発注者",
+        "受注者",
+        "当事者",
+        "貸主",
+        "借主",
+        "ユーザ",
+        "ベンダ",
+    ] {
+        contract += text.matches(pat).count();
+    }
+    if contract * 1000 >= chars * 3 {
+        Domain::Contract
+    } else if hits * 1000 >= chars * 2 {
         Domain::Legal
     } else {
         Domain::General
@@ -122,6 +144,8 @@ pub struct Config {
     pub thresholds: FxHashMap<EditKind, f32>,
     /// 一般文向けの閾値
     pub general_thresholds: FxHashMap<EditKind, f32>,
+    /// 契約書向けの閾値
+    pub contract_thresholds: FxHashMap<EditKind, f32>,
     /// 文書の種類を固定する (None なら文書ごとに自動判定)
     pub domain: Option<Domain>,
     pub enable_insert: bool,
@@ -173,6 +197,17 @@ impl Default for Config {
                 (EditKind::Inflection, 3.0),
                 (EditKind::Insert, 4.0),
                 (EditKind::Homophone, 4.5),
+                (EditKind::Char, f32::INFINITY),
+            ]
+            .into_iter()
+            .collect(),
+            // 契約書: JEITA のモデル契約 (解説付き、開発用) で決めた値
+            contract_thresholds: [
+                (EditKind::Delete, 5.0),
+                (EditKind::Substitute, 6.0),
+                (EditKind::Inflection, 3.5),
+                (EditKind::Insert, 4.5),
+                (EditKind::Homophone, 5.0),
                 (EditKind::Char, f32::INFINITY),
             ]
             .into_iter()
@@ -344,12 +379,19 @@ impl Checker {
             let chars: Vec<char> = normalized.chars().collect();
             let mut s = 0;
             for i in 0..=chars.len() {
-                // 空白も区切りにする: 条例の「第41条　固定資産税は」のようにラベルと本文を空白で分ける書き方が多く、
+                // 空白は、その前がラベルらしい (平仮名を含まない 15 文字以内) ときだけ区切りにする。
+                // 条例の「第41条　固定資産税は」のようにラベルと本文を空白で分ける書き方では、
                 // ひと続きの文として採点すると「第41条」直後の語が不自然に見えてしまう。
+                // 一方「期間が 1 年」のように文中の空白で切ると、「期間が」で文が終わったことになり、
+                // 文末の助詞を削る誤検出になる (契約書で多かった)。
+                // 「第29条の2」のように、ラベルに入る平仮名は「の」だけ
+                let label_like = |seg: &[char]| {
+                    seg.len() <= 15 && !seg.iter().any(|c| *c != 'の' && ('ぁ'..='ゖ').contains(c))
+                };
                 let end_here = i == chars.len()
                     || chars[i] == '\n'
                     || chars[i] == '。'
-                    || chars[i].is_whitespace();
+                    || (chars[i].is_whitespace() && label_like(&chars[s..i]));
                 if !end_here {
                     continue;
                 }
@@ -785,6 +827,7 @@ impl Checker {
         let t = match d {
             Domain::Legal => &self.cfg.thresholds,
             Domain::General => &self.cfg.general_thresholds,
+            Domain::Contract => &self.cfg.contract_thresholds,
         };
         t.get(&k).copied().unwrap_or(f32::INFINITY)
     }

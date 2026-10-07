@@ -47,22 +47,37 @@ python3 scripts/extract_wiki.py data/jawiki1.xml.bz2 \
 python3 scripts/fetch_reiki.py
 python3 scripts/exclude_eval.py fixtures/yokohama_shizei_jorei.txt < data/corpus/reiki.txt > data/corpus/reiki.f.txt
 
+# 5b. 契約書 (官公庁などのモデル契約書・標準約款・ガイドライン)。手順は scripts/contracts/README.md
+#     評価に使う JEITA / IPA アジャイル開発版は含めない。IPA モデル取引・契約書は評価データと重なる行を除いて足す
+uv run --with pypdf --with cryptography python scripts/contracts/eval_docs.py data/eval_contracts
+(cd scripts/contracts && for b in batch1 batch2 batch3 batch4; do python3 fetch.py batch $b.tsv; done \
+  && uv run --with pypdf --with cryptography python dump_raw.py \
+  && python3 build_contracts.py --out ../../data/corpus/contracts.txt)
+python3 - <<'PY'
+import re
+ev = re.sub(r"\s", "", "".join(open(f"data/eval_contracts/{n}.txt").read() for n in ["jeita_dev", "jeita_test", "ipa_agile_test"]))
+out = [l.rstrip("\n") for l in open("data/contracts_raw/contracts_ipa_model.txt")
+       if re.sub(r"\s", "", l) and not (len(re.sub(r"\s", "", l)) >= 20 and re.sub(r"\s", "", l)[:30] in ev)]
+open("data/corpus/contracts2.txt", "w").write(open("data/corpus/contracts.txt").read() + "\n".join(out) + "\n")
+PY
+
 # 6. 分かち書き (各トークンを「表層形\x1f品詞クラス」で出し、語彙は後から選ぶ)
-for f in egov wiki1.f reiki.f; do
+for f in egov wiki1.f reiki.f contracts2; do
   $BIN tokenize --with-class < "data/corpus/$f.txt" > "data/corpus/${f%.f}.wc"
 done
+# 契約書は小さい (約 180 万字) ので 10 倍の重みで数える (30 倍では契約書での誤検出が増えた)
+INPUTS=(data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc)
+for i in $(seq 1 10); do INPUTS+=(data/corpus/contracts2.wc); done
 cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
   | $BIN tokenize --inflections data/inflections.tsv --readings data/readings.tsv > /dev/null
 
 # 7. 語彙 1 万語 + 品詞クラス、3-gram、強い足切りで配布用モデル (約 13MB) を作る
-$BIN vocab --size 10000 -o data/vocab10k.txt data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+$BIN vocab --size 10000 -o data/vocab10k.txt "${INPUTS[@]}"
 #    誤変換の候補にする同音異字の語を足す (約 5 千語、+0.7MB)
 python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv data/homo_words.txt > data/vocab.txt
-$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin \
-  data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin "${INPUTS[@]}"
 # 8. 同音異字の判定に使う文内共起モデル (約 1.7MB)
-$BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt -o data/cooc.bin \
-  data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc
+$BIN build-cooc --model data/model.bin --vocab data/vocab.txt --homophones data/homo_words.txt -o data/cooc.bin "${INPUTS[@]}"
 # 9. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
 cp data/model.bin data/cooc.bin data/dist/
