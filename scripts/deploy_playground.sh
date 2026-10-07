@@ -10,6 +10,7 @@ SRC=playground/web
   exit 1
 }
 REV=$(git rev-parse --short HEAD)
+ORIGIN=$(git remote get-url origin)
 TMP=$(mktemp -d)
 cp -R "$SRC"/. "$TMP"/
 touch "$TMP/.nojekyll"
@@ -18,7 +19,6 @@ touch "$TMP/.nojekyll"
   git init -q -b gh-pages
   git add -A
   git commit -q -m "playground: celso ${REV} から生成"
+  git push -q -f "$ORIGIN" gh-pages
 )
-git push -f "$TMP" gh-pages:gh-pages
-git push -f origin gh-pages
 rm -rf "$TMP"
