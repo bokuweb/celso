@@ -8,7 +8,7 @@
 //! n-gram のキーは語 ID (24bit) を最大 4 つ詰めた u128 に次数を上位ビットで足したもの。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -63,11 +63,75 @@ fn fingerprint(key: u128) -> u64 {
     h | 1
 }
 
+/// 配布用の量子化済み 1 枠 (8 バイト)。キーは 32bit 指紋、確率と backoff は 16bit 固定小数。
+///
+/// 構築時の [`Slot`] (16 バイト) と同じ位置に同じ順で並べるので、線形探索の到達順も変わらない。
+/// 32bit 指紋の取り違え確率は 1 回の探索あたり 1e-9 程度で、結果への影響は無視できる。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct QSlot {
+    key: u32,
+    logp: u16,
+    bow: u16,
+}
+
+/// 量子化の範囲: log10 で [-QRANGE, 0]。確率は構築時に 1e-12 で下限を切っているので収まる。
+const QRANGE: f32 = 16.0;
+
+#[inline]
+fn quantize(v: f32) -> u16 {
+    ((-v).clamp(0.0, QRANGE) / QRANGE * 65535.0).round() as u16
+}
+
+#[inline]
+fn dequantize(q: u16) -> f32 {
+    -(q as f32) * (QRANGE / 65535.0)
+}
+
+#[inline]
+fn fingerprint32(key: u128) -> u32 {
+    ((fingerprint(key) >> 32) as u32) | 1
+}
+
+enum Table {
+    /// 構築中 (f32 のまま)
+    Build(Vec<Slot>),
+    /// 配布形式を mmap したもの (起動が速く、複数プロセスでページを共有できる)
+    Mapped {
+        map: memmap2::Mmap,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl Table {
+    fn len(&self) -> usize {
+        match self {
+            Table::Build(v) => v.len(),
+            Table::Mapped { len, .. } => *len,
+        }
+    }
+
+    #[inline]
+    fn qslots(&self) -> &[QSlot] {
+        match self {
+            Table::Mapped { map, offset, len } => {
+                // SAFETY: offset は 8 バイト境界に揃えて書き出しており、mmap の先頭はページ境界。
+                // QSlot は repr(C) の POD で、ファイルは読み取り専用で開いている。
+                unsafe {
+                    std::slice::from_raw_parts(map.as_ptr().add(*offset) as *const QSlot, *len)
+                }
+            }
+            Table::Build(_) => &[],
+        }
+    }
+}
+
 /// 完成済みモデル。
 pub struct Model {
     pub order: usize,
     vocab: FxHashMap<String, u32>,
-    slots: Vec<Slot>,
+    table: Table,
     mask: usize,
 }
 
@@ -91,14 +155,29 @@ impl Model {
         self.vocab.len()
     }
 
+    /// n-gram の (log10 確率, log10 backoff) を引く。
     #[inline]
-    fn get(&self, key: u128) -> Option<&Slot> {
-        let fp = fingerprint(key);
+    fn get(&self, key: u128) -> Option<(f32, f32)> {
         let mut i = hash(key) as usize & self.mask;
+        if let Table::Build(slots) = &self.table {
+            let fp = fingerprint(key);
+            loop {
+                let s = &slots[i];
+                if s.key == fp {
+                    return Some((s.logp, s.bow));
+                }
+                if s.key == 0 {
+                    return None;
+                }
+                i = (i + 1) & self.mask;
+            }
+        }
+        let slots = self.table.qslots();
+        let fp = fingerprint32(key);
         loop {
-            let s = &self.slots[i];
+            let s = &slots[i];
             if s.key == fp {
-                return Some(s);
+                return Some((dequantize(s.logp), dequantize(s.bow)));
             }
             if s.key == 0 {
                 return None;
@@ -116,17 +195,17 @@ impl Model {
             let h = &ctx[ctx.len() - (n - 1)..];
             buf[..n - 1].copy_from_slice(h);
             buf[n - 1] = w;
-            if let Some(s) = self.get(pack(&buf[..n])) {
-                return s.logp + bow;
+            if let Some((lp, _)) = self.get(pack(&buf[..n])) {
+                return lp + bow;
             }
             if n > 1
-                && let Some(s) = self.get(pack(h))
+                && let Some((_, b)) = self.get(pack(h))
             {
-                bow += s.bow;
+                bow += b;
             }
         }
         // 語彙外
-        self.get(pack(&[UNK])).map(|s| s.logp).unwrap_or(-7.0) + bow
+        self.get(pack(&[UNK])).map(|s| s.0).unwrap_or(-7.0) + bow
     }
 
     /// (ctx, w) について、モデルに実在する最長の n-gram の次数 (1..=order)。
@@ -144,72 +223,116 @@ impl Model {
         0
     }
 
+    /// 配布形式 (CELSOLM3: 量子化済み) で保存する。
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
-        w.write_all(b"CELSOLM2")?;
-        w.write_all(&(self.order as u32).to_le_bytes())?;
+        let pos = std::cell::Cell::new(0usize);
+        let put = |w: &mut BufWriter<File>, b: &[u8]| -> Result<()> {
+            w.write_all(b)?;
+            pos.set(pos.get() + b.len());
+            Ok(())
+        };
+        put(&mut w, b"CELSOLM3")?;
+        put(&mut w, &(self.order as u32).to_le_bytes())?;
         let mut words: Vec<(&String, &u32)> = self.vocab.iter().collect();
         words.sort_by_key(|(_, id)| **id);
-        w.write_all(&(words.len() as u32).to_le_bytes())?;
+        put(&mut w, &(words.len() as u32).to_le_bytes())?;
         for (word, id) in words {
-            w.write_all(&id.to_le_bytes())?;
-            w.write_all(&(word.len() as u16).to_le_bytes())?;
-            w.write_all(word.as_bytes())?;
+            put(&mut w, &id.to_le_bytes())?;
+            put(&mut w, &(word.len() as u16).to_le_bytes())?;
+            put(&mut w, word.as_bytes())?;
         }
-        w.write_all(&(self.slots.len() as u64).to_le_bytes())?;
-        // SAFETY: Slot は repr(C) の POD
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.slots.as_ptr() as *const u8,
-                self.slots.len() * size_of::<Slot>(),
-            )
+        put(&mut w, &(self.table.len() as u64).to_le_bytes())?;
+        // 表本体を 8 バイト境界に揃える (mmap してそのまま &[QSlot] として読むため)
+        let pad = (8 - pos.get() % 8) % 8;
+        put(&mut w, &[0u8; 8][..pad])?;
+        let q: Vec<QSlot>;
+        let slots: &[QSlot] = match &self.table {
+            Table::Build(v) => {
+                q = v
+                    .iter()
+                    .map(|s| {
+                        if s.key == 0 {
+                            QSlot::default()
+                        } else {
+                            QSlot {
+                                key: ((s.key >> 32) as u32) | 1,
+                                logp: quantize(s.logp),
+                                bow: quantize(s.bow),
+                            }
+                        }
+                    })
+                    .collect();
+                &q
+            }
+            _ => self.table.qslots(),
         };
-        w.write_all(bytes)?;
+        // SAFETY: QSlot は repr(C) の POD
+        let bytes =
+            unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, size_of_val(slots)) };
+        put(&mut w, bytes)?;
         Ok(())
     }
 
+    /// CELSOLM3 は mmap で開く (読み込みはほぼ一瞬)。旧形式の CELSOLM2 は変換用にメモリへ読む。
     pub fn load(path: &Path) -> Result<Self> {
-        let mut r = BufReader::with_capacity(
-            1 << 20,
-            File::open(path).with_context(|| format!("{path:?}"))?,
-        );
-        let mut magic = [0u8; 8];
-        r.read_exact(&mut magic)?;
-        if &magic != b"CELSOLM2" {
-            bail!("not a celso model");
-        }
-        let mut b4 = [0u8; 4];
-        let mut b2 = [0u8; 2];
-        let mut b8 = [0u8; 8];
-        r.read_exact(&mut b4)?;
-        let order = u32::from_le_bytes(b4) as usize;
-        r.read_exact(&mut b4)?;
-        let nwords = u32::from_le_bytes(b4) as usize;
+        let file = File::open(path).with_context(|| format!("{path:?}"))?;
+        // SAFETY: 読み取り専用で開いたモデルファイルを mmap する。実行中に書き換えないこと。
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        let pos = std::cell::Cell::new(0usize);
+        let bytes: &[u8] = &map;
+        let take = |n: usize| -> Result<&[u8]> {
+            let p = pos.get();
+            if bytes.len() < p + n {
+                bail!("truncated model file");
+            }
+            pos.set(p + n);
+            Ok(&bytes[p..p + n])
+        };
+        let magic = take(8)?.to_vec();
+        let v3 = match &magic[..] {
+            b"CELSOLM3" => true,
+            b"CELSOLM2" => false,
+            _ => bail!("not a celso model"),
+        };
+        let order = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+        let nwords = u32::from_le_bytes(take(4)?.try_into()?) as usize;
         let mut vocab = FxHashMap::default();
         vocab.reserve(nwords);
         for _ in 0..nwords {
-            r.read_exact(&mut b4)?;
-            let id = u32::from_le_bytes(b4);
-            r.read_exact(&mut b2)?;
-            let mut s = vec![0u8; u16::from_le_bytes(b2) as usize];
-            r.read_exact(&mut s)?;
-            vocab.insert(String::from_utf8(s)?, id);
+            let id = u32::from_le_bytes(take(4)?.try_into()?);
+            let len = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+            vocab.insert(std::str::from_utf8(take(len)?)?.to_string(), id);
         }
-        r.read_exact(&mut b8)?;
-        let nslots = u64::from_le_bytes(b8) as usize;
-        let mut slots = vec![Slot::default(); nslots];
-        // SAFETY: 同上
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                slots.as_mut_ptr() as *mut u8,
-                nslots * size_of::<Slot>(),
-            )
+        let nslots = u64::from_le_bytes(take(8)?.try_into()?) as usize;
+        let consumed = pos.get();
+        let table = if v3 {
+            let offset = consumed + (8 - consumed % 8) % 8;
+            if offset + nslots * size_of::<QSlot>() > map.len() {
+                bail!("truncated model file");
+            }
+            Table::Mapped {
+                map,
+                offset,
+                len: nslots,
+            }
+        } else {
+            let bytes = take(nslots * size_of::<Slot>())?;
+            let mut slots = vec![Slot::default(); nslots];
+            // SAFETY: Slot は repr(C) の POD。バイト列からコピーする。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    slots.as_mut_ptr() as *mut u8,
+                    bytes.len(),
+                );
+            }
+            Table::Build(slots)
         };
-        r.read_exact(bytes)?;
         Ok(Self {
             order,
             vocab,
-            slots,
+            table,
             mask: nslots - 1,
         })
     }
@@ -378,13 +501,13 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
     let mut model = Model {
         order: cfg.order,
         vocab,
-        slots: Vec::new(),
+        table: Table::Build(Vec::new()),
         mask: 0,
     };
     let total: usize = keep.iter().map(|k| k.iter().filter(|b| **b).count()).sum();
     // 線形探索で充填率 75% 程度までは問い合わせ速度がほぼ落ちない
     let cap = (total + total / 8).next_power_of_two().max(1024);
-    model.slots = vec![Slot::default(); cap];
+    model.table = Table::Build(vec![Slot::default(); cap]);
     model.mask = cap - 1;
     eprintln!("kept n-grams: {total}, slots: {cap}");
 
@@ -442,7 +565,7 @@ pub fn build(paths: &[impl AsRef<Path>], cfg: &BuildConfig) -> Result<Model> {
                 if den > 0.0
                     && let Some(i) = model.find_index(key)
                 {
-                    model.slots[i].bow = (freed / den).max(1e-12).log10() as f32;
+                    model.build_slots_mut()[i].bow = (freed / den).max(1e-12).log10() as f32;
                 }
             }
         }
@@ -460,11 +583,21 @@ fn unpack_ids(body: u128, n: usize) -> [u32; MAX_ORDER] {
 }
 
 impl Model {
+    fn build_slots_mut(&mut self) -> &mut Vec<Slot> {
+        match &mut self.table {
+            Table::Build(v) => v,
+            _ => panic!("model is not in build mode"),
+        }
+    }
+
     fn find_index(&self, key: u128) -> Option<usize> {
+        let Table::Build(slots) = &self.table else {
+            return None;
+        };
         let fp = fingerprint(key);
         let mut i = hash(key) as usize & self.mask;
         loop {
-            let s = &self.slots[i];
+            let s = &slots[i];
             if s.key == fp {
                 return Some(i);
             }
@@ -477,15 +610,17 @@ impl Model {
 
     fn insert(&mut self, key: u128, logp: f32) {
         let fp = fingerprint(key);
-        let mut i = hash(key) as usize & self.mask;
+        let mask = self.mask;
+        let slots = self.build_slots_mut();
+        let mut i = hash(key) as usize & mask;
         loop {
-            let s = &mut self.slots[i];
+            let s = &mut slots[i];
             if s.key == 0 || s.key == fp {
                 s.key = fp;
                 s.logp = logp;
                 return;
             }
-            i = (i + 1) & self.mask;
+            i = (i + 1) & mask;
         }
     }
 }
@@ -518,5 +653,15 @@ mod tests {
         assert!(m.logp(&[BOS, id("宿泊")], id("施設")) > m.logp(&[BOS, id("宿泊")], id("から")));
         // 文末の確率がまともに引ける
         assert!(m.logp(&[id("が"), id("ある")], EOS) > -0.5);
+        // 量子化して保存 → mmap で読み直しても確率はほぼ変わらない
+        let mp = dir.join("m.bin");
+        m.save(&mp).unwrap();
+        let q = Model::load(&mp).unwrap();
+        for (ctx, w) in [
+            (vec![BOS, id("宿泊")], id("施設")),
+            (vec![id("駅"), id("から")], id("施設")),
+        ] {
+            assert!((m.logp(&ctx, w) - q.logp(&ctx, w)).abs() < 1e-3);
+        }
     }
 }

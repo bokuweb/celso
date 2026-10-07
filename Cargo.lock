@@ -285,6 +285,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "delarocha",
+ "memchr",
  "memmap2",
  "rayon",
  "rustc-hash",

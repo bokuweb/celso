@@ -49,6 +49,14 @@ enum Cmd {
         output: PathBuf,
         inputs: Vec<PathBuf>,
     },
+    /// キャッシュの効果を測る: 初回 → 2 回目 (全文キャッシュ命中) → 1 文だけ編集して再検査。
+    BenchCache {
+        #[command(flatten)]
+        m: ModelArgs,
+        file: PathBuf,
+    },
+    /// 旧形式 (CELSOLM2) のモデルを配布形式 (CELSOLM3: 量子化・mmap 可) に変換する。
+    Convert { input: PathBuf, output: PathBuf },
     /// テキストを検査する (ファイル省略時は stdin)。
     Check {
         #[command(flatten)]
@@ -79,6 +87,9 @@ enum Cmd {
         /// 誤検出の例を表示する件数
         #[arg(long, default_value_t = 0)]
         show: usize,
+        /// 一般文の閾値を「法令文の閾値 + δ」として δ を振り、検出率と誤検出率の表を出す
+        #[arg(long)]
+        sweep: bool,
     },
 }
 
@@ -90,7 +101,13 @@ struct ModelArgs {
     inflections: PathBuf,
     #[arg(long, default_value = "data/readings.tsv")]
     readings: PathBuf,
-    /// 閾値 (log10): delete,substitute,inflection,insert,homophone,char (inf で無効)
+    /// 一般文向けの閾値 (同じ並び)。法令文らしくない文書に使う
+    #[arg(long, default_value = "4,4,3,2.5,4,inf")]
+    general_thresholds: String,
+    /// 文書の種類を固定する (legal / general)。省略時は文書ごとに自動判定
+    #[arg(long)]
+    domain: Option<String>,
+    /// 法令文向けの閾値 (log10): delete,substitute,inflection,insert,homophone,char (inf で無効)
     #[arg(long, default_value = "3,3,2,1.5,3,inf")]
     thresholds: String,
     /// 助詞の脱落 (挿入候補) を無効にする
@@ -141,6 +158,19 @@ impl ModelArgs {
         for (k, t) in ALL_KINDS.into_iter().zip(v) {
             cfg.thresholds.insert(k, t);
         }
+        let g: Vec<f32> = self
+            .general_thresholds
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        for (k, t) in ALL_KINDS.into_iter().zip(g) {
+            cfg.general_thresholds.insert(k, t);
+        }
+        cfg.domain = match self.domain.as_deref() {
+            Some("legal") => Some(celso::checker::Domain::Legal),
+            Some("general") => Some(celso::checker::Domain::General),
+            _ => None,
+        };
         cfg.enable_insert = !self.no_insert;
         cfg.novelty_order = self.novelty;
         cfg.doc_repeat_limit = if self.doc_repeat == 0 {
@@ -196,6 +226,43 @@ const ALL_KINDS: [EditKind; 6] = [
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::BenchCache { m, file } => {
+            let checker = m.load()?.with_cache();
+            let text = std::fs::read_to_string(file)?;
+            let t = Instant::now();
+            let a = checker.check_document(&text);
+            eprintln!(
+                "1st (cold): {} findings in {:.2?} ({} sentences cached)",
+                a.len(),
+                t.elapsed(),
+                checker.cached_sentences()
+            );
+            let t = Instant::now();
+            let b = checker.check_document(&text);
+            eprintln!("2nd (warm): {} findings in {:.2?}", b.len(), t.elapsed());
+            // 真ん中あたりの長い行に 1 文字足す (= 1 文だけ変わる編集)
+            let mut lines: Vec<String> = text.lines().map(String::from).collect();
+            let mid = lines.len() / 2;
+            let target = (mid..lines.len())
+                .find(|&i| lines[i].chars().count() > 30)
+                .unwrap_or(mid);
+            let at = lines[target].char_indices().nth(10).map_or(0, |(i, _)| i);
+            lines[target].insert(at, 'の');
+            let edited = lines.join("\n");
+            let t = Instant::now();
+            let c = checker.check_document(&edited);
+            eprintln!(
+                "3rd (1 sentence edited): {} findings in {:.2?}",
+                c.len(),
+                t.elapsed()
+            );
+            Ok(())
+        }
+        Cmd::Convert { input, output } => {
+            Model::load(&input)?.save(&output)?;
+            eprintln!("wrote {output:?}");
+            Ok(())
+        }
         Cmd::BuildDict { raw_dir, output } => {
             celso::tokenize::build_dict(&raw_dir, &output)?;
             eprintln!("wrote {output:?}");
@@ -283,7 +350,12 @@ fn main() -> Result<()> {
             seed,
             sweep,
         } => eval_cmd(m, file, n, seed, sweep),
-        Cmd::EvalJwtd { m, file, show } => eval_jwtd(m, file, show),
+        Cmd::EvalJwtd {
+            m,
+            file,
+            show,
+            sweep,
+        } => eval_jwtd(m, file, show, sweep),
     }
 }
 
@@ -378,8 +450,14 @@ fn is_kanji(c: char) -> bool {
 }
 
 fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Result<()> {
-    let checker = m.load()?;
+    let mut checker = m.load()?;
     let text = std::fs::read_to_string(&file)?;
+    // 誤り文は 1 文ずつ検査するので、文書の種類は元の文書全体で判定したものに固定する
+    if checker.cfg.domain.is_none() {
+        let d = celso::checker::detect_domain(&norm(&text));
+        eprintln!("domain: {d:?}");
+        checker.cfg.domain = Some(d);
+    }
     // 平仮名を含む程度の長さの行を「文」として使う
     let mut sents: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -605,8 +683,17 @@ fn diff_span(pre: &[char], post: &[char]) -> (usize, usize) {
     (p, pre.len() - s)
 }
 
-fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize) -> Result<()> {
-    let checker = m.load()?;
+fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize, sweep: bool) -> Result<()> {
+    let mut checker = m.load()?;
+    let legal = checker.cfg.thresholds.clone();
+    if sweep {
+        // 一般文の閾値を下限まで下げて 1 回だけ検査し、後から δ ごとに足切りする
+        for (k, v) in checker.cfg.general_thresholds.iter_mut() {
+            if v.is_finite() {
+                *v = legal[k];
+            }
+        }
+    }
     struct Rec {
         pre: String,
         post: String,
@@ -616,13 +703,14 @@ fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize) -> Result<()> {
     for line in std::fs::read_to_string(&file)?.lines() {
         let v: serde_json::Value = serde_json::from_str(line)?;
         // 誤りが 1 箇所の文だけを使う (検出位置の正誤を判定しやすくするため)
-        let Some(diffs) = v["diffs"].as_array() else {
-            continue;
+        // gold.jsonl には diffs が無いので、カテゴリ "gold" として全件使う
+        let cat = match v["diffs"].as_array() {
+            Some(diffs) if diffs.len() == 1 => {
+                diffs[0]["category"].as_str().unwrap_or("").to_string()
+            }
+            Some(_) => continue,
+            None => "gold".to_string(),
         };
-        if diffs.len() != 1 {
-            continue;
-        }
-        let cat = diffs[0]["category"].as_str().unwrap_or("").to_string();
         let pre = norm(v["pre_text"].as_str().unwrap_or(""));
         let post = norm(v["post_text"].as_str().unwrap_or(""));
         if pre != post {
@@ -636,6 +724,35 @@ fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize) -> Result<()> {
     let posts = all.split_off(recs.len());
     let res: Vec<(Vec<Finding>, Vec<Finding>)> = all.into_iter().zip(posts).collect();
     eprintln!("checked {} pairs in {:.2?}", recs.len(), t.elapsed());
+    if sweep {
+        println!("δ     detect  correct  fp/文");
+        for di in 0..=10 {
+            let delta = di as f32 * 0.5;
+            let keep = |f: &&Finding| f.delta >= legal[&f.kind] + delta;
+            let (mut det, mut cor, mut fp) = (0, 0, 0);
+            for (r, (fe, fc)) in recs.iter().zip(&res) {
+                let pre: Vec<char> = r.pre.chars().collect();
+                let post: Vec<char> = r.post.chars().collect();
+                let (a, b) = diff_span(&pre, &post);
+                let fe: Vec<&Finding> = fe.iter().filter(keep).collect();
+                if fe.iter().any(|f| f.start <= b && a <= f.end) {
+                    det += 1;
+                }
+                if fe.iter().any(|f| apply(&r.pre, f) == r.post) {
+                    cor += 1;
+                }
+                fp += fc.iter().filter(keep).count();
+            }
+            let n = recs.len() as f64;
+            println!(
+                "{delta:<5.1} {:>6.1}% {:>7.1}% {:>6.1}%",
+                100.0 * det as f64 / n,
+                100.0 * cor as f64 / n,
+                100.0 * fp as f64 / n
+            );
+        }
+        return Ok(());
+    }
     let mut cats: std::collections::BTreeMap<String, [usize; 4]> = Default::default();
     let mut shown = 0;
     for (r, (fe, fc)) in recs.iter().zip(&res) {
