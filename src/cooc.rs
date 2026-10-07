@@ -167,6 +167,11 @@ impl Cooc {
         Ok(())
     }
 
+    /// バイト列から読む (mmap できない環境向け。ファイル上と同じく表は展開しない)。
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::parse(Backing::Owned(bytes))
+    }
+
     /// mmap で開く (行の中身は読み込まず、語の位置の索引だけを作る)。
     pub fn load(path: &Path) -> Result<Self> {
         let file = File::open(path)?;

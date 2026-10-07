@@ -2,6 +2,8 @@
 
 高速・軽量な日本語誤字脱字チェッカーの試作。
 
+**Playground: https://bokuweb.github.io/celso/** （ブラウザの中だけで動き、入力した文章はどこにも送信されない）
+
 **修正候補を作り、単語 n-gram 言語モデルで編集前後を比べる**という古典的な手法を、法令文向けに工夫して組み合わせている。
 
 | 項目 | 値 |
@@ -157,6 +159,21 @@ cargo test --release -- --include-ignored               # 例文の回帰テス�
 
 - 閾値は `--thresholds`（法令文）と `--general-thresholds`（一般文）で指定する。並びは `delete,substitute,inflection,insert,homophone,char` で、log10 の値。`inf` で無効にする。
 - `scripts/size_sweep*.sh` と `scripts/set_sweep.sh` は、サイズと精度の比較に使ったスクリプト。
+
+## Playground (WebAssembly)
+
+[playground/](playground/) は、celso をブラウザで動かす crate と静的ページ。GitHub Pages (`gh-pages` ブランチ) で配信している。
+
+- `default-features = false` で celso を使う。Zig コアの代わりに delarocha の純 Rust 実装で分かち書きし、IPADIC の生ファイル (lex.csv / matrix.def / char.def / unk.def) から辞書を作る。MLM は外す。
+- モデルは mmap できないので、`Model::from_bytes` / `Cooc::from_bytes` でメモリへ読む。
+- 読み込みと検査は Web Worker で行う。データ (gzip で約 27MB) は gzip のまま置き、`DecompressionStream` で展開する。
+- 純 Rust の分かち書きでも、市税条例全文の指摘はネイティブ版と完全に一致する (`playground/tests/example.rs`)。
+
+```bash
+scripts/build_playground.sh     # wasm のビルドとデータの gzip (playground/web へ)
+python3 -m http.server -d playground/web 8000   # 手元で確認
+scripts/deploy_playground.sh    # gh-pages ブランチへ push
+```
 
 ## 既知の課題
 

@@ -1,7 +1,12 @@
 pub mod checker;
 pub mod cooc;
 pub mod lm;
+#[cfg(feature = "mlm")]
 pub mod mlm;
+#[cfg(not(feature = "mlm"))]
+#[path = "mlm_stub.rs"]
+pub mod mlm;
+#[cfg(feature = "ngset")]
 pub mod ngset;
 pub mod norm;
 pub mod synth;

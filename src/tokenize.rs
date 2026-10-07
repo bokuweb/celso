@@ -2,12 +2,21 @@
 //!
 //! 辞書は MeCab 形式の生ファイル (UTF-8 化した mecab-ipadic) から一度だけバイナリへ変換し
 //! (`celso build-dict`)、起動時はそれを mmap する。ワーカーはスレッドごとに 1 つ持つ。
+//!
+//! `zig` feature を外したとき (ブラウザ向けの playground) は、delarocha の純 Rust 実装を使い、
+//! IPADIC の生ファイル (lex.csv / matrix.def / char.def / unk.def) のバイト列から辞書を作る
+//! ([`Tokenizer::from_raw`])。どちらの経路でもトークンの組み立ては共通 ([`assemble`])。
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "zig")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+#[cfg(feature = "zig")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(feature = "zig")]
 use delarocha::ffi::{ZigTokenizer, ZigWorker};
 
 /// 数字列は 1 トークンにまとめて、このキーで言語モデルに渡す (「第34号」と「第5号」を同一視する)。
@@ -21,6 +30,7 @@ pub fn default_dict_path() -> PathBuf {
 }
 
 /// MeCab 形式の生辞書 (lex.csv / matrix.def / char.def / unk.def を含むディレクトリ) をバイナリへ変換する。
+#[cfg(feature = "zig")]
 pub fn build_dict(raw_dir: &Path, out: &Path) -> Result<()> {
     ZigTokenizer::write_binary_from_raw_paths(
         raw_dir.join("lex.csv"),
@@ -103,11 +113,7 @@ fn has_kanji(s: &str) -> bool {
         .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || c == '々')
 }
 
-// 辞書はプロセスで 1 つだけ読み、ワーカーがそれを 'static で借りる
-static DICT: OnceLock<ZigTokenizer> = OnceLock::new();
-
 thread_local! {
-    static WORKER: RefCell<Option<ZigWorker<'static>>> = const { RefCell::new(None) };
     /// 語 ID → 解析済みの品詞情報。同じ語は同じ feature を持つので、文字列の分割と intern を
     /// 語ごとに 1 回で済ませる (トークンの組み立てが分かち書き本体より重かったため)。
     static FEATS: RefCell<rustc_hash::FxHashMap<u32, Feat>> = RefCell::new(rustc_hash::FxHashMap::default());
@@ -160,11 +166,86 @@ fn parse_feat(feature: &str, surface: &str) -> Feat {
     }
 }
 
+/// 分かち書き器が返す 1 語 (経路によらない共通の形)。
+struct RawToken<'a> {
+    surface: &'a str,
+    start_char: usize,
+    end_char: usize,
+    word_id: u32,
+    is_unknown: bool,
+    feature: &'a str,
+}
+
+/// 分かち書きの結果から [`Token`] の列を組み立てる。空白トークンは落とし、割れた数字列をまとめる。
+fn assemble<'a>(raws: impl Iterator<Item = RawToken<'a>>, capacity: usize) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(capacity);
+    for v in raws {
+        let surface = v.surface;
+        if surface.trim().is_empty() {
+            continue;
+        }
+        // 未知語の feature は文字種ごとに共通なので語 ID ではキャッシュできるが、
+        // 読みは持たない (has_kanji の判定が surface 依存になるため、未知語は毎回解析する)
+        let feat = if v.is_unknown {
+            parse_feat(v.feature, surface)
+        } else {
+            FEATS.with(|c| {
+                let mut c = c.borrow_mut();
+                if let Some(f) = c.get(&v.word_id) {
+                    return *f;
+                }
+                if c.len() >= FEAT_CACHE_LIMIT {
+                    c.clear();
+                }
+                let f = parse_feat(v.feature, surface);
+                c.insert(v.word_id, f);
+                f
+            })
+        };
+        let tok = Token {
+            surface: surface.to_string(),
+            start: v.start_char,
+            end: v.end_char,
+            pos: feat.pos,
+            pos1: feat.pos1,
+            conj_type: feat.conj_type,
+            conj_form: feat.conj_form,
+            base: feat.base,
+            reading: feat.reading,
+        };
+        // 「1」「,」「500」のように割れた数字列を 1 トークンへまとめる
+        if let Some(prev) = out.last_mut()
+            && prev.is_num()
+            && prev.end == tok.start
+            && tok.is_num()
+        {
+            prev.surface.push_str(&tok.surface);
+            prev.end = tok.end;
+            continue;
+        }
+        out.push(tok);
+    }
+    out
+}
+
+// ---- Zig コアの経路 (既定) ----
+
+// 辞書はプロセスで 1 つだけ読み、ワーカーがそれを 'static で借りる
+#[cfg(feature = "zig")]
+static DICT: OnceLock<ZigTokenizer> = OnceLock::new();
+
+#[cfg(feature = "zig")]
+thread_local! {
+    static WORKER: RefCell<Option<ZigWorker<'static>>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "zig")]
 #[derive(Clone, Copy)]
 pub struct Tokenizer {
     dict: &'static ZigTokenizer,
 }
 
+#[cfg(feature = "zig")]
 impl Tokenizer {
     /// 既定パスの辞書で作る。
     pub fn new() -> Result<Self> {
@@ -195,55 +276,88 @@ impl Tokenizer {
             let Ok(views) = worker.tokenize_borrowed_views(text) else {
                 return Vec::new();
             };
-            let mut out: Vec<Token> = Vec::with_capacity(views.len());
-            for v in views.iter() {
-                let surface = v.surface();
-                if surface.trim().is_empty() {
-                    continue;
-                }
-                // 未知語の feature は文字種ごとに共通なので語 ID ではキャッシュできるが、
-                // 読みは持たない (has_kanji の判定が surface 依存になるため、未知語は毎回解析する)
-                let wid = v.word_id();
-                let feat = if v.is_unknown() {
-                    parse_feat(v.feature(), surface)
-                } else {
-                    FEATS.with(|c| {
-                        let mut c = c.borrow_mut();
-                        if let Some(f) = c.get(&wid) {
-                            return *f;
-                        }
-                        if c.len() >= FEAT_CACHE_LIMIT {
-                            c.clear();
-                        }
-                        let f = parse_feat(v.feature(), surface);
-                        c.insert(wid, f);
-                        f
-                    })
-                };
-                let tok = Token {
-                    surface: surface.to_string(),
-                    start: v.start_char,
-                    end: v.end_char,
-                    pos: feat.pos,
-                    pos1: feat.pos1,
-                    conj_type: feat.conj_type,
-                    conj_form: feat.conj_form,
-                    base: feat.base,
-                    reading: feat.reading,
-                };
-                // 「1」「,」「500」のように割れた数字列を 1 トークンへまとめる
-                if let Some(prev) = out.last_mut()
-                    && prev.is_num()
-                    && prev.end == tok.start
-                    && tok.is_num()
-                {
-                    prev.surface.push_str(&tok.surface);
-                    prev.end = tok.end;
-                    continue;
-                }
-                out.push(tok);
+            let n = views.len();
+            assemble(
+                views.iter().map(|v| RawToken {
+                    surface: v.surface(),
+                    start_char: v.start_char,
+                    end_char: v.end_char,
+                    word_id: v.word_id(),
+                    is_unknown: v.is_unknown(),
+                    feature: v.feature(),
+                }),
+                n,
+            )
+        })
+    }
+}
+
+// ---- 純 Rust の経路 (zig feature なし。ブラウザ向け) ----
+
+#[cfg(not(feature = "zig"))]
+static PURE_DICT: OnceLock<delarocha::Tokenizer> = OnceLock::new();
+
+#[cfg(not(feature = "zig"))]
+thread_local! {
+    static PURE_WORKER: RefCell<Option<delarocha::Worker<'static>>> = const { RefCell::new(None) };
+}
+
+#[cfg(not(feature = "zig"))]
+#[derive(Clone, Copy)]
+pub struct Tokenizer {
+    dict: &'static delarocha::Tokenizer,
+}
+
+#[cfg(not(feature = "zig"))]
+impl Tokenizer {
+    /// [`Self::from_raw`] で辞書を読み込んだ後に使う。読み込み前はエラー。
+    pub fn new() -> Result<Self> {
+        let dict = PURE_DICT.get().ok_or_else(|| {
+            anyhow::anyhow!("辞書が読み込まれていない (Tokenizer::from_raw を先に呼ぶ)")
+        })?;
+        Ok(Self { dict })
+    }
+
+    /// IPADIC の生ファイル (UTF-8) のバイト列から辞書を作る。2 回目以降は最初の辞書を使う。
+    pub fn from_raw(
+        lex_csv: &[u8],
+        matrix_def: &[u8],
+        char_def: &[u8],
+        unk_def: &[u8],
+    ) -> Result<Self> {
+        if PURE_DICT.get().is_none() {
+            let dict = delarocha::SystemDictionaryBuilder::from_readers(
+                lex_csv, matrix_def, char_def, unk_def,
+            )?;
+            let _ = PURE_DICT.set(delarocha::Tokenizer::new(dict));
+        }
+        Self::new()
+    }
+
+    /// `text` は [`crate::norm::norm`] 済みであること。空白トークンは落とす。
+    pub fn tokenize(&self, text: &str) -> Vec<Token> {
+        PURE_WORKER.with(|w| {
+            let mut w = w.borrow_mut();
+            if w.is_none() {
+                *w = Some(self.dict.create_worker());
             }
-            out
+            let Some(worker) = w.as_mut() else {
+                return Vec::new();
+            };
+            let Ok(toks) = worker.tokenize(text) else {
+                return Vec::new();
+            };
+            assemble(
+                toks.iter().map(|t| RawToken {
+                    surface: &t.surface,
+                    start_char: t.start_char,
+                    end_char: t.end_char,
+                    word_id: t.word_id,
+                    is_unknown: t.is_unknown(),
+                    feature: &t.feature,
+                }),
+                toks.len(),
+            )
         })
     }
 }

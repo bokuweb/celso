@@ -114,6 +114,8 @@ enum Table {
         offset: usize,
         len: usize,
     },
+    /// 配布形式をメモリ上のバイト列から読んだもの (ブラウザなど mmap できない環境向け)
+    Owned(Vec<QSlot>),
 }
 
 impl Table {
@@ -121,6 +123,7 @@ impl Table {
         match self {
             Table::Build(v) => v.len(),
             Table::Mapped { len, .. } => *len,
+            Table::Owned(v) => v.len(),
         }
     }
 
@@ -134,6 +137,7 @@ impl Table {
                     std::slice::from_raw_parts(map.as_ptr().add(*offset).cast::<QSlot>(), *len)
                 }
             }
+            Table::Owned(v) => v,
             Table::Build(_) => &[],
         }
     }
@@ -189,7 +193,10 @@ pub fn load_any(path: &Path) -> Result<Box<dyn LanguageModel>> {
     let mut magic = [0u8; 8];
     std::io::Read::read_exact(&mut File::open(path)?, &mut magic)?;
     if &magic == b"CELSONS1" {
-        Ok(Box::new(crate::ngset::NgramSet::load(path)?))
+        #[cfg(feature = "ngset")]
+        return Ok(Box::new(crate::ngset::NgramSet::load(path)?));
+        #[cfg(not(feature = "ngset"))]
+        anyhow::bail!("存在フィルタ版のモデル (CELSONS1) は ngset feature が必要");
     } else {
         Ok(Box::new(Model::load(path)?))
     }
@@ -329,7 +336,7 @@ impl Model {
                     .collect();
                 &q
             }
-            Table::Mapped { .. } => self.table.qslots(),
+            Table::Mapped { .. } | Table::Owned(_) => self.table.qslots(),
         };
         // SAFETY: QSlot は repr(C) の POD
         let bytes =
@@ -343,45 +350,85 @@ impl Model {
         let file = File::open(path).with_context(|| format!("{}", path.display()))?;
         // SAFETY: 読み取り専用で開いたモデルファイルを mmap する。実行中に書き換えないこと。
         let map = unsafe { memmap2::Mmap::map(&file)? };
-        let pos = std::cell::Cell::new(0usize);
-        let bytes: &[u8] = &map;
-        let take = |n: usize| -> Result<&[u8]> {
-            let p = pos.get();
-            if bytes.len() < p + n {
-                bail!("truncated model file");
-            }
-            pos.set(p + n);
-            Ok(&bytes[p..p + n])
-        };
-        if take(8)? != b"CELSOLM4" {
-            bail!("not a celso model (CELSOLM4)");
-        }
-        let order = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-        let nwords = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-        let mut vocab = FxHashMap::default();
-        vocab.reserve(nwords);
-        for _ in 0..nwords {
-            let id = u32::from_le_bytes(take(4)?.try_into()?);
-            let len = u16::from_le_bytes(take(2)?.try_into()?) as usize;
-            vocab.insert(std::str::from_utf8(take(len)?)?.to_string(), id);
-        }
-        let nslots = u64::from_le_bytes(take(8)?.try_into()?) as usize;
-        let consumed = pos.get();
-        let offset = consumed + (4 - consumed % 4) % 4;
-        if offset + nslots * size_of::<QSlot>() > map.len() {
-            bail!("truncated model file");
-        }
+        let header = parse_header(&map)?;
         Ok(Self {
-            order,
-            vocab,
+            order: header.order,
+            vocab: header.vocab,
             table: Table::Mapped {
                 map,
-                offset,
-                len: nslots,
+                offset: header.offset,
+                len: header.nslots,
             },
-            cap: nslots,
+            cap: header.nslots,
         })
     }
+
+    /// 配布形式 (CELSOLM4) をバイト列から読む (mmap できない環境向け。表はメモリへコピーする)。
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let header = parse_header(bytes)?;
+        let raw = &bytes[header.offset..header.offset + header.nslots * size_of::<QSlot>()];
+        // QSlot は repr(C) で fp (u16 LE)・logp・bow の順に 4 バイト。保存時と同じく little endian で読む
+        let slots: Vec<QSlot> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| QSlot {
+                fp: u16::from_le_bytes([c[0], c[1]]),
+                logp: c[2],
+                bow: c[3],
+            })
+            .collect();
+        Ok(Self {
+            order: header.order,
+            vocab: header.vocab,
+            table: Table::Owned(slots),
+            cap: header.nslots,
+        })
+    }
+}
+
+/// CELSOLM4 のヘッダ (次数・語彙・表の位置)。
+struct Header {
+    order: usize,
+    vocab: FxHashMap<String, u32>,
+    offset: usize,
+    nslots: usize,
+}
+
+fn parse_header(bytes: &[u8]) -> Result<Header> {
+    let pos = std::cell::Cell::new(0usize);
+    let take = |n: usize| -> Result<&[u8]> {
+        let p = pos.get();
+        if bytes.len() < p + n {
+            bail!("truncated model file");
+        }
+        pos.set(p + n);
+        Ok(&bytes[p..p + n])
+    };
+    if take(8)? != b"CELSOLM4" {
+        bail!("not a celso model (CELSOLM4)");
+    }
+    let order = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+    let nwords = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+    let mut vocab = FxHashMap::default();
+    vocab.reserve(nwords);
+    for _ in 0..nwords {
+        let id = u32::from_le_bytes(take(4)?.try_into()?);
+        let len = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+        vocab.insert(std::str::from_utf8(take(len)?)?.to_string(), id);
+    }
+    let nslots = u64::from_le_bytes(take(8)?.try_into()?) as usize;
+    let consumed = pos.get();
+    let offset = consumed + (4 - consumed % 4) % 4;
+    if offset + nslots * size_of::<QSlot>() > bytes.len() {
+        bail!("truncated model file");
+    }
+    Ok(Header {
+        order,
+        vocab,
+        offset,
+        nslots,
+    })
 }
 
 /// 構築パラメータ。

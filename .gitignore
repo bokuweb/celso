@@ -3,3 +3,8 @@ target/
 target-local/
 data/
 /target-exp
+/playground/target
+/playground/web/pkg
+/playground/web/assets
+/playground/web/IPADIC-COPYING.txt
+/target-wasm

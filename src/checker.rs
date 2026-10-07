@@ -367,7 +367,8 @@ impl Checker {
     pub fn check_many(&self, texts: &[&str]) -> Vec<Vec<Finding>> {
         use rayon::prelude::*;
         let dbg = std::env::var_os("CELSO_DEBUG").is_some();
-        let t0 = std::time::Instant::now();
+        // 時計はデバッグ表示のときだけ読む (wasm32-unknown-unknown では Instant::now が panic するため)
+        let t0 = dbg.then(std::time::Instant::now);
         // (テキスト番号, 文の開始オフセット, 正規化済みの文, 文書の種類)
         let mut sents: Vec<(usize, usize, String, Domain)> = Vec::new();
         for (ti, text) in texts.iter().enumerate() {
@@ -422,7 +423,7 @@ impl Checker {
         if dbg {
             eprintln!(
                 "  split+lookup {:.2?} ({} sents, {} todo)",
-                t0.elapsed(),
+                t0.map(|t| t.elapsed()).unwrap_or_default(),
                 sents.len(),
                 todo.len()
             );
@@ -451,7 +452,10 @@ impl Checker {
             }
         }
         if dbg {
-            eprintln!("  compute+store {:.2?}", t0.elapsed());
+            eprintln!(
+                "  compute+store {:.2?}",
+                t0.map(|t| t.elapsed()).unwrap_or_default()
+            );
         }
         let mut out: Vec<Vec<Finding>> = vec![Vec::new(); texts.len()];
         for ((ti, off, _, _), fs) in sents.iter().zip(done) {
@@ -1228,10 +1232,17 @@ pub fn load_inflections(
     path: &std::path::Path,
     keep: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<FxHashMap<(String, String), Vec<String>>> {
-    use std::io::BufRead;
-    let mut m: FxHashMap<(String, String), Vec<String>> = FxHashMap::default();
     // ファイル全体を文字列にせず 1 行ずつ読む (読み込み時の一時メモリを抑える)
-    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+    load_inflections_from_reader(std::io::BufReader::new(std::fs::File::open(path)?), keep)
+}
+
+/// [`load_inflections`] の読み込み元を任意の reader にしたもの (ブラウザではバイト列から読む)。
+pub fn load_inflections_from_reader(
+    reader: impl std::io::BufRead,
+    keep: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<FxHashMap<(String, String), Vec<String>>> {
+    let mut m: FxHashMap<(String, String), Vec<String>> = FxHashMap::default();
+    for line in reader.lines() {
         let line = line?;
         let mut it = line.split('\t');
         if let (Some(b), Some(t), Some(s)) = (it.next(), it.next(), it.next())
@@ -1252,9 +1263,16 @@ pub fn load_readings(
     path: &std::path::Path,
     keep: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<FxHashMap<String, Vec<(String, u32)>>> {
-    use std::io::BufRead;
+    load_readings_from_reader(std::io::BufReader::new(std::fs::File::open(path)?), keep)
+}
+
+/// [`load_readings`] の読み込み元を任意の reader にしたもの (ブラウザではバイト列から読む)。
+pub fn load_readings_from_reader(
+    reader: impl std::io::BufRead,
+    keep: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<FxHashMap<String, Vec<(String, u32)>>> {
     let mut m: FxHashMap<String, Vec<(String, u32)>> = FxHashMap::default();
-    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+    for line in reader.lines() {
         let line = line?;
         let mut it = line.split('\t');
         if let (Some(r), Some(s), Some(c)) = (it.next(), it.next(), it.next())
