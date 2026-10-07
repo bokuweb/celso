@@ -149,6 +149,8 @@ pub trait LanguageModel: Send + Sync {
     /// (ctx, w) について、実在する最長の n-gram の次数。0 は語彙外。
     fn match_order(&self, ctx: &[u32], w: u32) -> usize;
     fn vocab_len(&self) -> usize;
+    /// 語彙の一覧 (語, ID)。別モデルとの ID の対応づけに使う。
+    fn words(&self) -> Vec<(&str, u32)>;
 
     /// トークンの語 ID。語彙に無ければ品詞クラスの ID (学習時に語彙外を品詞クラスへ置き換えている)。
     fn token_id(&self, t: &crate::tokenize::Token) -> u32 {
@@ -176,6 +178,9 @@ impl LanguageModel for Model {
     }
     fn vocab_len(&self) -> usize {
         Model::vocab_len(self)
+    }
+    fn words(&self) -> Vec<(&str, u32)> {
+        self.vocab.iter().map(|(w, id)| (w.as_str(), *id)).collect()
     }
 }
 

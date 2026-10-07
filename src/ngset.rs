@@ -126,6 +126,10 @@ impl LanguageModel for NgramSet {
     fn vocab_len(&self) -> usize {
         self.vocab.len()
     }
+
+    fn words(&self) -> Vec<(&str, u32)> {
+        self.vocab.iter().map(|(w, id)| (w.as_str(), *id)).collect()
+    }
 }
 
 /// 分かち書き済みコーパスから n-gram の集合を作る。`min_count[n-1]` 回未満の n-gram は入れない。

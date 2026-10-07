@@ -20,8 +20,8 @@ fn detects_all_errors_in_example_sentence() {
         Tokenizer::new().unwrap(),
         Box::new(Model::load(model).unwrap()),
         cfg,
-        load_inflections(Path::new("data/inflections.tsv")).unwrap(),
-        load_readings(Path::new("data/readings.tsv")).unwrap(),
+        load_inflections(Path::new("data/inflections.tsv"), &|_| true).unwrap(),
+        load_readings(Path::new("data/readings.tsv"), &|_| true).unwrap(),
     )
     .with_mlm(Mlm::load(Path::new("data/mlm")).unwrap());
     let text =

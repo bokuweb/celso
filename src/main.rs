@@ -131,13 +131,13 @@ struct ModelArgs {
     #[arg(long, default_value = "data/readings.tsv")]
     readings: PathBuf,
     /// 一般文向けの閾値 (同じ並び)。法令文らしくない文書に使う
-    #[arg(long, default_value = "4,4,3,2.5,4,inf")]
+    #[arg(long, default_value = "4.5,5.5,3,4,4.5,inf")]
     general_thresholds: String,
     /// 文書の種類を固定する (legal / general)。省略時は文書ごとに自動判定
     #[arg(long)]
     domain: Option<String>,
     /// 法令文向けの閾値 (log10): delete,substitute,inflection,insert,homophone,char (inf で無効)
-    #[arg(long, default_value = "3,3,2,1.5,3,inf")]
+    #[arg(long, default_value = "4,4.5,1.5,3.5,4,inf")]
     thresholds: String,
     /// 助詞の脱落 (挿入候補) を無効にする
     #[arg(long)]
@@ -149,7 +149,7 @@ struct ModelArgs {
     #[arg(long, default_value_t = 2)]
     doc_repeat: usize,
     /// 2 段目のマスク言語モデル (HuggingFace 形式のディレクトリ)。"none" で無効
-    #[arg(long, default_value = "data/mlm")]
+    #[arg(long, default_value = "none")]
     mlm: String,
     /// 最終スコア = n-gram Δ + mlm_weight × MLM Δ
     #[arg(long, default_value_t = 1.0)]
@@ -221,9 +221,10 @@ impl ModelArgs {
     fn load(&self) -> Result<Checker> {
         let t = Instant::now();
         let lm = lm::load_any(&self.model)?;
-        let infl = load_inflections(&self.inflections)?;
+        let keep = |w: &str| lm.word_id(w) != celso::lm::UNK;
+        let infl = load_inflections(&self.inflections, &keep)?;
         let readings = if self.readings.exists() {
-            load_readings(&self.readings)?
+            load_readings(&self.readings, &keep)?
         } else {
             Default::default()
         };
@@ -580,7 +581,7 @@ fn eval_cmd(m: ModelArgs, file: PathBuf, n: usize, seed: u64, sweep: bool) -> Re
             }
         }
     }
-    let infl = load_inflections(&m.inflections)?;
+    let infl = load_inflections(&m.inflections, &|_| true)?;
     let mut rng = Rng::new(seed);
     let kinds = [
         EditKind::Delete,

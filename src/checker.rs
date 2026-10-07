@@ -153,15 +153,28 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let mut t = FxHashMap::default();
-        t.insert(EditKind::Delete, 3.0);
-        t.insert(EditKind::Substitute, 3.0);
-        t.insert(EditKind::Inflection, 2.0);
-        t.insert(EditKind::Insert, 1.5);
-        t.insert(EditKind::Homophone, 3.0);
+        // 配布モデル (語彙 1 万・3-gram・強い足切り) 向けに、市税条例の人工誤り (調整用シード) で
+        // 原文での誤検出が 1 万字あたり 1 件弱になるよう決めた値
+        t.insert(EditKind::Delete, 4.0);
+        t.insert(EditKind::Substitute, 4.5);
+        t.insert(EditKind::Inflection, 1.5);
+        t.insert(EditKind::Insert, 3.5);
+        t.insert(EditKind::Homophone, 4.0);
         // 文字単位の編集は遅く誤検出も多いので既定では無効 (README 参照)
         t.insert(EditKind::Char, f32::INFINITY);
         Self {
-            general_thresholds: t.iter().map(|(k, v)| (*k, v + 1.0)).collect(),
+            // 一般文: JWTD の gold (開発用) で種類ごとに決めた値。活用と取り違えは
+            // 一般文で正しい言い換えを拾いやすいので、法令文より大きく上げる
+            general_thresholds: [
+                (EditKind::Delete, 4.5),
+                (EditKind::Substitute, 5.5),
+                (EditKind::Inflection, 3.0),
+                (EditKind::Insert, 4.0),
+                (EditKind::Homophone, 4.5),
+                (EditKind::Char, f32::INFINITY),
+            ]
+            .into_iter()
+            .collect(),
             thresholds: t,
             domain: None,
             enable_insert: true,
@@ -409,10 +422,11 @@ impl Checker {
             return Vec::new();
         }
         let ids = self.ids_of(&toks);
+        // MLM が無くても、閾値の 1.0 下までは別案として見せるために残す
         let slack = if self.mlm.is_some() {
-            self.cfg.stage1_slack
+            self.cfg.stage1_slack.max(1.0)
         } else {
-            0.0
+            1.0
         };
 
         let mut cands: Vec<Finding> = Vec::new();
@@ -477,14 +491,20 @@ impl Checker {
         let mut out = Vec::new();
         for mut site in sites {
             site.sort_by(|x, y| y.delta.total_cmp(&x.delta));
-            let best = &site[0];
-            if best.delta < self.threshold(best.kind, d) {
-                continue;
-            }
-            let mut f = site[0].clone();
-            f.alternatives = site[1..]
+            // 採否は「自分の種類の閾値を超えた案」の中で最良のもので決める
+            // (閾値の低い種類の案が、閾値に届かない別種の案に埋もれないように)
+            let Some(bi) = site
                 .iter()
-                .filter(|a| a.delta >= self.threshold(a.kind, d) - 1.0)
+                .position(|f| f.delta >= self.threshold(f.kind, d))
+            else {
+                continue;
+            };
+            let mut f = site[bi].clone();
+            f.alternatives = site
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| *i != bi && a.delta >= self.threshold(a.kind, d) - 1.0)
+                .map(|(_, a)| a)
                 .take(2)
                 .map(|a| Suggestion {
                     start: a.start,
@@ -986,36 +1006,57 @@ impl Checker {
 }
 
 /// 分かち書き時に集めた活用表 (TSV: 原形 \t 活用型 \t 表層形) を読む。
+///
+/// `keep` で表層形を絞る (言語モデルの語彙に無い語は候補にしても採点できないので、
+/// 読み込み時に落としてメモリを抑える。語彙 1 万語なら 10 分の 1 以下になる)。
 pub fn load_inflections(
     path: &std::path::Path,
+    keep: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<FxHashMap<(String, String), Vec<String>>> {
+    use std::io::BufRead;
     let mut m: FxHashMap<(String, String), Vec<String>> = FxHashMap::default();
-    for line in std::fs::read_to_string(path)?.lines() {
+    // ファイル全体を文字列にせず 1 行ずつ読む (読み込み時の一時メモリを抑える)
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+        let line = line?;
         let mut it = line.split('\t');
-        if let (Some(b), Some(t), Some(s)) = (it.next(), it.next(), it.next()) {
+        if let (Some(b), Some(t), Some(s)) = (it.next(), it.next(), it.next())
+            && keep(s)
+        {
             m.entry((b.to_string(), t.to_string()))
                 .or_default()
                 .push(s.to_string());
         }
     }
+    m.shrink_to_fit();
     Ok(m)
 }
 
-/// 同音異字表 (TSV: 読み \t 表層形 \t 出現数) を読む。
+/// 同音異字表 (TSV: 読み \t 表層形 \t 出現数) を読む。`keep` は [`load_inflections`] と同じ。
+/// 候補に使うのは出現 20 回以上の語だけなので、それ未満もここで落とす。
 pub fn load_readings(
     path: &std::path::Path,
+    keep: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<FxHashMap<String, Vec<(String, u32)>>> {
+    use std::io::BufRead;
     let mut m: FxHashMap<String, Vec<(String, u32)>> = FxHashMap::default();
-    for line in std::fs::read_to_string(path)?.lines() {
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+        let line = line?;
         let mut it = line.split('\t');
-        if let (Some(r), Some(s), Some(c)) = (it.next(), it.next(), it.next()) {
+        if let (Some(r), Some(s), Some(c)) = (it.next(), it.next(), it.next())
+            && keep(s)
+            && c.parse::<u32>().unwrap_or(0) >= 20
+        {
             m.entry(r.to_string())
                 .or_default()
                 .push((s.to_string(), c.parse().unwrap_or(0)));
         }
     }
+    // 読みに 1 語しか無ければ同音異字の候補にならない
+    m.retain(|_, v| v.len() >= 2);
     for v in m.values_mut() {
         v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        v.shrink_to_fit();
     }
+    m.shrink_to_fit();
     Ok(m)
 }
