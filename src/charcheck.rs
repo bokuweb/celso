@@ -21,6 +21,9 @@ use crate::rerank::{Features, Reranker};
 /// 補う・置き換える候補にするひらがな。
 const KANA: &str = "あいうえおかきくけこがぎぐげごさしすせそざじずぜぞたちつてとだぢづでどなにぬねのはひふへほばびぶべぼぱぴぷぺぽまみむめもやゆよらりるれろわをんっゃゅょー";
 
+/// 助詞どうしの置き換えを表す特徴量 (`partpair`) に使う助詞。
+const PARTICLES: &str = "のにがをはでともへやか";
+
 /// 補う・置き換える候補に残すひらがなの、実際の誤字での出現数の下限 (補う・置き換えの合計)。
 const KANA_MIN_PRIOR: u32 = 200;
 
@@ -170,6 +173,7 @@ impl CharRanker {
 
     /// 判定器の特徴量 (学習に使ったスクリプトと同じ名前・同じ値にする)。
     #[must_use]
+    #[allow(clippy::many_single_char_names)] // 学習スクリプト (scripts/charrank/feat.py) と同じ短い名前で突き合わせやすくする
     pub fn features(&self, c: &CharCandidate, fixed: &[char], w: &WordSignals) -> Features {
         let f = &c.finding;
         let (o, r) = (f.original.as_str(), f.replacement.as_str());
@@ -221,7 +225,6 @@ impl CharRanker {
             add(format!("{t}:o={o}"), 1.0);
             add(format!("{t}:r={r}"), 1.0);
         }
-        const PARTICLES: &str = "のにがをはでともへやか";
         let is_particle = |s: &str| s.chars().count() == 1 && PARTICLES.contains(s);
         if t == "subn" && is_particle(o) && is_particle(r) {
             add("partpair".to_string(), 1.0);
@@ -281,6 +284,7 @@ impl CharChecker {
     }
 
     /// 同じ読みの漢字の表 (TSV: 漢字 \t 同じ読みの漢字を並べた文字列) を読む。
+    #[must_use]
     pub fn parse_homo(text: &str) -> FxHashMap<char, Vec<char>> {
         let mut m = FxHashMap::default();
         for line in text.lines().filter(|l| !l.starts_with('#')) {
@@ -335,6 +339,7 @@ impl CharChecker {
 
     /// [`Self::find`] と同じ直しを、採否の判定に使う値つきで返す。
     #[must_use]
+    #[allow(clippy::too_many_lines)] // 怪しい位置 → 直し方ごとの候補 → 位置ごとの上位、の流れを 1 か所で追えるようにしている
     pub fn candidates(&self, sent: &str) -> Vec<CharCandidate> {
         let chars: Vec<char> = sent.chars().collect();
         // 空白は分かち書きと同じく飛ばす (文字の位置は元の文のまま持つ)

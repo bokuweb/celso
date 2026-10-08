@@ -301,7 +301,7 @@ impl Model {
                 acc += b;
             }
         }
-        let unk = self.get(pack(&[UNK])).map(|s| s.0).unwrap_or(-7.0);
+        let unk = self.get(pack(&[UNK])).map_or(-7.0, |s| s.0);
         let mut buf = [0u32; MAX_ORDER];
         out.clear();
         for &w in ws {

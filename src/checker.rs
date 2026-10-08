@@ -392,6 +392,9 @@ impl Checker {
 
     /// 文字モデルを後から付ける (playground で、本体の準備ができてから読み込むため)。
     /// 結果が変わるので文単位のキャッシュは捨てる。
+    ///
+    /// # Panics
+    /// キャッシュのロックが poison している場合 (別スレッドが検査中に panic した場合)。
     pub fn set_charcheck(&mut self, c: crate::charcheck::CharChecker) {
         self.charcheck = Some(c);
         if let Some(cache) = &self.cache {
@@ -578,6 +581,7 @@ impl Checker {
 
     /// 1 段目: n-gram で候補を採点し、閾値 (MLM 併用時は少し緩めた値) を超えたものを残す。
     /// 重なる・隣接する候補を「箇所」にまとめ、箇所ごとに上位 top_k 件を返す (delta は n-gram の Δ)。
+    #[allow(clippy::too_many_lines)] // 候補の出どころ (単語・パターン・カタカナ語・文字モデル・規則) を 1 か所で見渡せるようにしている
     fn stage1(&self, sent: &str, d: Domain) -> Vec<Vec<Finding>> {
         let toks = self.tok.tokenize(sent);
         if toks.is_empty() {
