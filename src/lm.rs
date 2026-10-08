@@ -150,6 +150,11 @@ pub trait LanguageModel: Send + Sync {
     fn word_id(&self, w: &str) -> u32;
     /// log10 P(w | ctx) (軽量版では n-gram の有無から作る擬似スコア)
     fn logp(&self, ctx: &[u32], w: u32) -> f32;
+    /// 同じ文脈で複数の語の log10 P(w | ctx) を求める (文脈側の後退重みを語ごとに引き直さない実装がある)。
+    fn logp_many(&self, ctx: &[u32], ws: &[u32], out: &mut Vec<f32>) {
+        out.clear();
+        out.extend(ws.iter().map(|&w| self.logp(ctx, w)));
+    }
     /// (ctx, w) について、実在する最長の n-gram の次数。0 は語彙外。
     fn match_order(&self, ctx: &[u32], w: u32) -> usize;
     fn vocab_len(&self) -> usize;
@@ -176,6 +181,9 @@ impl LanguageModel for Model {
     }
     fn logp(&self, ctx: &[u32], w: u32) -> f32 {
         Model::logp(self, ctx, w)
+    }
+    fn logp_many(&self, ctx: &[u32], ws: &[u32], out: &mut Vec<f32>) {
+        Model::logp_many(self, ctx, ws, out);
     }
     fn match_order(&self, ctx: &[u32], w: u32) -> usize {
         Model::match_order(self, ctx, w)
@@ -276,6 +284,39 @@ impl Model {
         }
         // 語彙外
         self.get(pack(&[UNK])).map(|s| s.0).unwrap_or(-7.0) + bow
+    }
+
+    /// 同じ文脈 `ctx` での複数の語の log10 P(w | ctx)。[`Self::logp`] と同じ値を、
+    /// 文脈の後退重みを 1 回だけ引いて求める (候補の字を並べて採点する文字モデルの絞り込み用)。
+    pub fn logp_many(&self, ctx: &[u32], ws: &[u32], out: &mut Vec<f32>) {
+        let n_max = self.order.min(ctx.len() + 1);
+        // bow_before[n]: 次数 n を試す前までに足した後退重み (n より上の次数の文脈の重みの和)
+        let mut bow_before = [0.0f32; MAX_ORDER + 1];
+        let mut acc = 0.0f32;
+        for n in (1..=n_max).rev() {
+            bow_before[n] = acc;
+            if n > 1
+                && let Some((_, b)) = self.get(pack(&ctx[ctx.len() - (n - 1)..]))
+            {
+                acc += b;
+            }
+        }
+        let unk = self.get(pack(&[UNK])).map(|s| s.0).unwrap_or(-7.0);
+        let mut buf = [0u32; MAX_ORDER];
+        out.clear();
+        for &w in ws {
+            let mut v = unk + acc;
+            for n in (1..=n_max).rev() {
+                let h = &ctx[ctx.len() - (n - 1)..];
+                buf[..n - 1].copy_from_slice(h);
+                buf[n - 1] = w;
+                if let Some((lp, _)) = self.get(pack(&buf[..n])) {
+                    v = lp + bow_before[n];
+                    break;
+                }
+            }
+            out.push(v);
+        }
     }
 
     /// (ctx, w) について、モデルに実在する最長の n-gram の次数 (1..=order)。
@@ -806,6 +847,44 @@ mod tests {
             (vec![id("駅"), id("から")], id("施設")),
         ] {
             assert!((m.logp(&ctx, w) - q.logp(&ctx, w)).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn logp_many_matches_logp() {
+        let dir = std::env::temp_dir().join("celso-lm-test-many");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.txt");
+        let mut f = File::create(&p).unwrap();
+        for _ in 0..20 {
+            writeln!(f, "宿泊 施設 が ある").unwrap();
+            writeln!(f, "駅 から 施設 まで 歩く").unwrap();
+        }
+        let m = build(
+            &[&p],
+            &BuildConfig {
+                order: 3,
+                min_word_count: 1,
+                min_count: [1; MAX_ORDER],
+                vocab: None,
+                keep_words: None,
+                keep_min_count: [1; MAX_ORDER],
+            },
+        )
+        .unwrap();
+        let id = |w| m.word_id(w);
+        // 3-gram が有る語・2-gram までしか無い語・1-gram だけの語・語彙外を混ぜる
+        let ws = [id("施設"), id("から"), id("歩く"), UNK, EOS];
+        let mut out = Vec::new();
+        for ctx in [
+            vec![BOS, id("宿泊")],
+            vec![id("駅"), id("から")],
+            vec![id("まで")],
+        ] {
+            m.logp_many(&ctx, &ws, &mut out);
+            for (&w, &v) in ws.iter().zip(&out) {
+                assert!((m.logp(&ctx, w) - v).abs() < 1e-6, "{ctx:?} {w}");
+            }
         }
     }
 }

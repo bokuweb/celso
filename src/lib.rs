@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod charcheck;
 pub mod checker;
 pub mod cooc;
 pub mod katakana;

@@ -13,6 +13,8 @@
 //! | patterns.tsv | | 実際の誤字から集めた書き換えパターン |
 //! | rerank.tsv | | 採否の判定器 |
 //! | katakana.tsv | | カタカナ語の出現数 (カタカナ語の打ち間違いの検出) |
+//! | charlm.bin, kanji_homo.tsv | | 文字単位の言語モデルと同じ読みの漢字の表 (一般文の語の中の 1 字の誤りの検出。両方そろったときだけ使う) |
+//! | charrank.tsv | | 文字単位の直しの採否の判定器 |
 
 use std::path::Path;
 
@@ -49,6 +51,15 @@ pub fn load_dir(dir: &Path, tok: Tokenizer, cfg: Config) -> Result<Checker> {
     let path = dir.join("katakana.tsv");
     if path.exists() {
         checker = checker.with_katakana(crate::katakana::Katakana::load(&path)?);
+    }
+    let (charlm, homo) = (dir.join("charlm.bin"), dir.join("kanji_homo.tsv"));
+    if charlm.exists() && homo.exists() {
+        let mut c = crate::charcheck::CharChecker::load(&charlm, &homo)?;
+        let path = dir.join("charrank.tsv");
+        if path.exists() {
+            c = c.with_rank(crate::charcheck::CharRanker::load(&path)?);
+        }
+        checker = checker.with_charcheck(c);
     }
     let path = dir.join("rerank.tsv");
     if path.exists() {

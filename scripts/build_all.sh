@@ -170,3 +170,40 @@ PY
 # 12. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
 cp data/model.bin data/cooc.bin data/func.bin data/rerank.tsv data/patterns.tsv data/katakana.tsv data/dist/
+
+# 13. 文字単位の言語モデル (一般文の語の中の 1 字の誤り。src/charcheck.rs)。文字の 5-gram を足切りして約 46MB
+#     (足切り 1,5,10,20,40 の 26MB 版は JWTD の検出が 0.7pt 低い)。契約書は単語モデルと同じく重みを足す
+mkdir -p data/charlm
+CH_INPUTS=()
+for f in wiki1.f egov reiki.f contracts2; do
+  python3 scripts/charlm/to_chars.py < data/corpus/$f.txt > data/charlm/$f.ch
+  CH_INPUTS+=(data/charlm/$f.ch)
+done
+for i in 1 2 3 4; do CH_INPUTS+=(data/charlm/contracts2.ch); done
+if [ -n "${CELSO_HANREI_TEXT:-}" ]; then
+  python3 scripts/charlm/to_chars.py < $HANREI_DIR/train.txt > data/charlm/hanrei.ch
+  CH_INPUTS+=(data/charlm/hanrei.ch)
+fi
+$BIN build-lm --order 5 --min-word-count 30 --min-count 1,3,6,10,16 -o data/charlm.bin "${CH_INPUTS[@]}"
+#    漢字を置き換える候補 (読みの表 + JWTD の 1 字の取り違え。CC BY-SA 3.0)
+python3 scripts/charlm/kanji_homo.py data/ipadic-utf8/lex.csv data/jwtd/train_rest.jsonl data/kanji_homo.tsv \
+  data/charlm/wiki1.f.ch data/charlm/egov.ch ${CELSO_HANREI_TEXT:+data/charlm/hanrei.ch}
+cp data/charlm.bin data/kanji_homo.tsv data/dist/
+
+# 14. 文字単位の直しの判定器 (scripts/charrank/)。JWTD train_rest から 9.6 万組を抜き出し、候補を書き出して学習する。
+#     負例には判例要旨の正しい文 (学習用から 6000 件、重み 2) も使う。閾値 1.0 は JWTD 先頭 5000 件・判例要旨 dev・
+#     wiki2 test で決めた (単語モデルが見落とした箇所だけで、正しい文での誤検出を 1 文あたり +0.6pt 程度に抑える値)
+mkdir -p data/charrank
+python3 scripts/charrank/make_data.py data/jwtd/train_rest.jsonl data/charrank
+#    候補を出すときも配布時と同じひらがなに絞るため、出現数だけの判定器 (重みなし) を使う
+sed 's/^/#prior\t/' data/charrank/prior.tsv > data/charrank/prior_only.tsv
+TRAIN_SETS=$(for k in $(seq 0 15); do echo tr_pre$k tr_post$k; done)
+if [ -n "${CELSO_HANREI_TEXT:-}" ]; then
+  shuf -n 6000 --random-source=<(yes) $HANREI_DIR/train.txt > data/charrank/han_tr.txt
+  TRAIN_SETS="$TRAIN_SETS han_tr"
+fi
+for n in $TRAIN_SETS; do
+  scripts/charrank/dump.sh data/dist data/charrank/prior_only.tsv data/charrank/$n.txt data/charrank/$n.c
+done
+uv run --with scikit-learn python scripts/charrank/train.py data/charrank data/charrank data/charrank/prior.tsv 2 1.0 data/charrank.tsv
+cp data/charrank.tsv data/dist/

@@ -88,6 +88,22 @@ async function load() {
     f.katakana,
   );
   post('ready', { ms: Math.round(performance.now() - started) });
+  await loadChar();
+}
+
+// 文字モデル (約 36MB) は、本体の準備ができてから読み込む (最初に使えるまでの時間を延ばさない)
+const CHAR_ASSETS = [
+  ['charlm', 'assets/charlm.bin.gz'],
+  ['homo', 'assets/kanji_homo.tsv.gz'],
+  ['rank', 'assets/charrank.tsv.gz'],
+];
+
+async function loadChar() {
+  const started = performance.now();
+  const files = await Promise.all(CHAR_ASSETS.map(async ([key, url]) => [key, await fetchGzip(url, () => {})]));
+  const f = Object.fromEntries(files);
+  playground.enableChar(f.charlm, f.homo, f.rank);
+  post('char-ready', { ms: Math.round(performance.now() - started) });
 }
 
 self.onmessage = (e) => {

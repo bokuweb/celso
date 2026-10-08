@@ -9,6 +9,7 @@ use celso::checker::{
     Checker, Config, Domain, Finding, detect_domain, load_inflections_from_reader,
     load_readings_from_reader,
 };
+use celso::charcheck::{CharChecker, CharRanker};
 use celso::cooc::Cooc;
 use celso::katakana::Katakana;
 use celso::lm::{Model, UNK};
@@ -103,6 +104,16 @@ impl Engine {
         Ok(Self { checker })
     }
 
+    /// 文字モデル (文字の 5-gram・漢字を置き換える候補・文字単位の判定器) を付ける。
+    pub fn enable_char(&mut self, charlm: &[u8], kanji_homo: &[u8], charrank: &[u8]) -> anyhow::Result<()> {
+        let lm = Model::from_bytes(charlm)?;
+        let homo = CharChecker::parse_homo(std::str::from_utf8(kanji_homo)?);
+        let rank = CharRanker::from_tsv(std::str::from_utf8(charrank)?)?;
+        self.checker
+            .set_charcheck(CharChecker::new(Box::new(lm), homo).with_rank(rank));
+        Ok(())
+    }
+
     /// 文書を検査して JSON にする。
     pub fn check_json(&self, text: &str) -> String {
         let findings: Vec<Finding> = self.checker.check_document(text);
@@ -177,6 +188,14 @@ impl Playground {
         })
         .map(Playground)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// 文字モデルを付ける (本体の準備ができてから、別に読み込んで渡す)。
+    #[wasm_bindgen(js_name = enableChar)]
+    pub fn enable_char(&mut self, charlm: &[u8], kanji_homo: &[u8], charrank: &[u8]) -> Result<(), JsValue> {
+        self.0
+            .enable_char(charlm, kanji_homo, charrank)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// 検査結果の JSON (`{ domain, findings: [{ start, end, original, replacement, kind, score, alternatives }] }`)。

@@ -297,6 +297,8 @@ pub struct Checker {
     patterns: Option<crate::patterns::Patterns>,
     /// カタカナ語の出現数の表 (カタカナ語の打ち間違いの検出に使う。無ければ使わない)
     katakana: Option<crate::katakana::Katakana>,
+    /// 文字単位の言語モデル (語の中の 1 字の誤りの検出に使う。無ければ使わない)
+    charcheck: Option<crate::charcheck::CharChecker>,
     /// 文単位の結果キャッシュ (正規化済みの文のハッシュ → その文の指摘)。
     /// 指摘は文の中身だけで決まる (文書内繰り返しの抑制は文書全体で毎回かけ直す) ので、
     /// 編集されていない文は再計算しなくてよい。
@@ -360,6 +362,7 @@ impl Checker {
             rerank: None,
             patterns: None,
             katakana: None,
+            charcheck: None,
             cache: None,
             trace: std::env::var_os("CELSO_TRACE").is_some(),
         }
@@ -378,6 +381,22 @@ impl Checker {
     pub fn with_rerank(mut self, rerank: crate::rerank::Reranker) -> Self {
         self.rerank = Some(rerank);
         self
+    }
+
+    /// 文字単位の言語モデルで語の中の 1 字の誤りを拾う。
+    #[must_use]
+    pub fn with_charcheck(mut self, c: crate::charcheck::CharChecker) -> Self {
+        self.charcheck = Some(c);
+        self
+    }
+
+    /// 文字モデルを後から付ける (playground で、本体の準備ができてから読み込むため)。
+    /// 結果が変わるので文単位のキャッシュは捨てる。
+    pub fn set_charcheck(&mut self, c: crate::charcheck::CharChecker) {
+        self.charcheck = Some(c);
+        if let Some(cache) = &self.cache {
+            cache.write().unwrap().clear();
+        }
     }
 
     /// カタカナ語の打ち間違いの検出を使う。
@@ -598,6 +617,102 @@ impl Checker {
         }
         if let Some(k) = &self.katakana {
             cands.extend(k.find(sent));
+        }
+        // 文字モデルは一般文だけで使う。法令文・契約書は「主監」「副参事」のような
+        // 一般のコーパスで珍しい語が多く、語の中の 1 字の誤りより誤検出のほうがずっと多くなる
+        // (一宮市の例規で 1 万字あたり 1.8 → 4.5 件)
+        if let Some(c) = self.charcheck.as_ref().filter(|_| d == Domain::General) {
+            let found = c.candidates(sent);
+            if !found.is_empty() {
+                // 文字モデルだけでは珍しいが正しい並び (固有名詞・専門語) を拾いすぎるので、
+                // 単語の言語モデルでも直した文が自然になるかを確かめる
+                let base = self.sentence_logp(&ids);
+                let unk = ids.iter().filter(|&&x| x == UNK).count();
+                let aux_base = self.aux_sentence_logp(&toks);
+                let cooc_ctx = self.cooc.as_ref().map(|cooc| {
+                    cooc.context(self.lm.as_ref(), toks.iter().map(|t| t.surface.as_str()))
+                });
+                let mut sorted_ids = ids[1..ids.len() - 1].to_vec();
+                sorted_ids.sort_unstable();
+                // 単語モデル・パターンなどですでに指摘する箇所 (と 1 文字以内で隣り合う箇所) は調べない。
+                // 指摘の数は変わらず、文字モデルの役目は単語モデルが見落とす箇所を拾うことなので
+                // (判定器もそういう候補だけで学習している)
+                let taken: Vec<(usize, usize)> = cands
+                    .iter()
+                    .filter(|g| g.delta >= self.threshold(g.kind, d))
+                    .map(|g| (g.start, g.end.max(g.start + 1)))
+                    .collect();
+                for cc in found {
+                    let f = &cc.finding;
+                    let end = f.end.max(f.start + 1);
+                    if taken.iter().any(|&(a, b)| f.start <= b + 1 && a <= end + 1) {
+                        continue;
+                    }
+                    let fixed = apply_finding(sent, f);
+                    let fixed_toks = self.tok.tokenize(&fixed);
+                    let fixed_ids = self.ids_of(&fixed_toks);
+                    let sd = self.sentence_logp(&fixed_ids) - base;
+                    let ad = if self.aux.is_some() {
+                        self.aux_sentence_logp(&fixed_toks) - aux_base
+                    } else {
+                        0.0
+                    };
+                    // 同音異字と同じく、文全体の語との相性 (直して入る語 − 直して消える語)
+                    let co = match (&self.cooc, &cooc_ctx) {
+                        (Some(cooc), Some(ctx)) => {
+                            let mut fx = fixed_ids[1..fixed_ids.len() - 1].to_vec();
+                            fx.sort_unstable();
+                            let gained: f32 = sorted_minus(&fx, &sorted_ids)
+                                .iter()
+                                .map(|&h| cooc.score(h, ctx, None))
+                                .sum();
+                            let lost: f32 = sorted_minus(&sorted_ids, &fx)
+                                .iter()
+                                .map(|&h| cooc.score(h, ctx, None))
+                                .sum();
+                            (gained - lost) / std::f32::consts::LN_10
+                        }
+                        _ => 0.0,
+                    };
+                    let cd = cc.delta;
+                    if self.trace {
+                        let fixed_unk = fixed_ids.iter().filter(|&&x| x == UNK).count();
+                        eprintln!(
+                            "  [char] 「{}」→「{}」 文字={cd:.2} 単語={sd:.2} 位置={} logp={:.2} 差={:.2} 怪しい={} 未知語={} 語数={} 文法={ad:.2} 共起={co:.2}\t{fixed}",
+                            f.original,
+                            f.replacement,
+                            f.start,
+                            cc.logp,
+                            cc.margin,
+                            cc.suspicious_count,
+                            unk as i64 - fixed_unk as i64,
+                            fixed_ids.len() as i64 - ids.len() as i64,
+                        );
+                    }
+                    let accepted = match &c.rank {
+                        Some(rk) => {
+                            let fixed_chars: Vec<char> = fixed.chars().collect();
+                            let w = crate::charcheck::WordSignals {
+                                delta: sd,
+                                unknown_removed: unk as i32
+                                    - fixed_ids.iter().filter(|&&x| x == UNK).count() as i32,
+                                token_count_change: fixed_ids.len() as i32 - ids.len() as i32,
+                                aux_delta: ad,
+                                cooc_delta: co,
+                            };
+                            let score = rk.score(&cc, &fixed_chars, &w);
+                            if self.trace {
+                                eprintln!("    判定={score:.2} (閾値 {:.2})", rk.tau(d));
+                            }
+                            score > rk.tau(d)
+                        }
+                        None => char_accepted(&f.original, &f.replacement, cd, sd),
+                    };
+                    if accepted {
+                        cands.push(cc.finding);
+                    }
+                }
+            }
         }
         cands.extend(repeated_function_words(&toks));
         cands.extend(wrong_case_before_ni_verbs(&toks));
@@ -1316,10 +1431,18 @@ impl Checker {
     }
 
     fn sentence_logp(&self, ids: &[u32]) -> f32 {
-        let order = self.lm.order();
-        (1..ids.len())
-            .map(|j| self.lm.logp(&ids[j.saturating_sub(order - 1)..j], ids[j]))
-            .sum()
+        seq_logp(self.lm.as_ref(), ids)
+    }
+
+    /// 文法モデルでの文の対数確率 (文法モデルが無ければ 0)。
+    fn aux_sentence_logp(&self, toks: &[Token]) -> f32 {
+        self.aux.as_ref().map_or(0.0, |aux| {
+            let mut v = Vec::with_capacity(toks.len() + 2);
+            v.push(BOS);
+            v.extend(toks.iter().map(|t| aux.token_id(t)));
+            v.push(EOS);
+            seq_logp(aux.as_ref(), &v)
+        })
     }
 
     /// 文字単位の編集 (1 文字削除・隣接入れ替え・かな 1 文字補完) を、
@@ -1678,7 +1801,7 @@ pub fn is_notation_variant(a: &str, b: &str) -> bool {
 }
 
 /// S の各位置 j の対数確率 (直前 order-1 語の文脈)。候補ごとの「元」の和を使い回すために文ごとに 1 回求める。
-fn position_logps(lm: &dyn LanguageModel, s: &[u32]) -> Vec<f32> {
+pub(crate) fn position_logps(lm: &dyn LanguageModel, s: &[u32]) -> Vec<f32> {
     let order = lm.order();
     (0..s.len())
         .map(|j| {
@@ -1693,7 +1816,7 @@ fn position_logps(lm: &dyn LanguageModel, s: &[u32]) -> Vec<f32> {
 
 /// 言語モデル `lm` で、S[a..b] を repl に置き換えたときの対数確率の改善幅。
 /// 元の文の対数確率は文ごとに求めた `lp` ([`position_logps`]) を使い回す。
-fn delta_pre(
+pub(crate) fn delta_pre(
     lm: &dyn LanguageModel,
     s: &[u32],
     lp: &[f32],
@@ -1827,6 +1950,57 @@ fn dedup_site(sent: &str, site: &mut Vec<Finding>) {
             true
         }
     });
+}
+
+/// 列全体の対数確率 (先頭の BOS は条件にだけ使う)。
+fn seq_logp(lm: &dyn LanguageModel, ids: &[u32]) -> f32 {
+    let order = lm.order();
+    (1..ids.len())
+        .map(|j| lm.logp(&ids[j.saturating_sub(order - 1)..j], ids[j]))
+        .sum()
+}
+
+/// `a` にあって `b` に無い要素 (重複も数える)。どちらも昇順に並べたもの。
+fn sorted_minus(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() {
+        if j < b.len() && b[j] < a[i] {
+            j += 1;
+        } else if j < b.len() && b[j] == a[i] {
+            i += 1;
+            j += 1;
+        } else {
+            out.push(a[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 文字単位の指摘を採るか。`char_delta` は文字モデルでの改善幅、`word_delta` は単語モデルでの文の改善幅 (どちらも log10)。
+///
+/// 直し方の種類ごとに下限を決める (JWTD の開発用 先頭 5000 件と判例要旨・Wikipedia の正しい文で、
+/// 正解の候補を多く残しつつ正しい文での候補を正解の 1 割程度に抑える値)。
+/// - 1 字の削除は、正しい文でも文字モデルの尤度が上がりやすい (珍しい固有名詞・専門語の字を消すと
+///   自然になる) ので、とくに厳しくし、かなだけにする。漢字 (「再更正」の「再」、「各号」の「各」)・
+///   英字・数字・括弧 (「A社」「(普通自動車)」) は、正しい文での候補が正解の倍以上あった
+/// - 助詞どうしの置き換え (「の → が」) は単語モデルの受け持ちなので、文字モデルでは出さない
+fn char_accepted(original: &str, replacement: &str, char_delta: f32, word_delta: f32) -> bool {
+    const PARTICLES: &str = "のにがをはでともへやか";
+    let is_kanji_str = |s: &str| s.chars().next().is_some_and(is_kanji);
+    let is_word_chars = |s: &str| s.chars().all(|c| is_kanji(c) || is_kana(c));
+    let is_particle = |s: &str| s.chars().count() == 1 && PARTICLES.contains(s);
+    let (min_char, min_word) = match (original.chars().count(), replacement.chars().count()) {
+        (0, _) => (4.0, 3.0),                                  // 補う (脱字)
+        (_, 0) if original.chars().all(is_kana) => (8.0, 0.0), // 消す (余分な字)
+        (2, 2) if is_word_chars(original) => (6.0, 0.0),       // 入れ替え
+        (_, 0) | (2, 2) => return false,
+        _ if is_kanji_str(original) => (5.0, 3.0), // 同じ読みの漢字への置き換え
+        _ if is_particle(original) && is_particle(replacement) => return false,
+        _ => (7.0, 0.0), // かなの置き換え
+    };
+    char_delta >= min_char && word_delta >= min_word
 }
 
 /// 判定器の `#tau_kind` に書く、名詞の間の「の」を消す候補の名前 (他の削除より厳しい閾値にする)。
@@ -2388,6 +2562,28 @@ mod tests {
         assert!(pattern_accepted(g, 4.0, 0.0));
         assert!(!pattern_accepted(Domain::Legal, 4.0, 0.0));
         assert!(pattern_accepted(Domain::Contract, 0.0, 1.5));
+    }
+
+    #[test]
+    fn char_findings_use_thresholds_per_edit_type() {
+        // 熟語の中の同じ読みの漢字 (「骨董品 300 店 → 点」): 文字・単語の両方で改善するときだけ
+        assert!(char_accepted("店", "点", 6.0, 3.5));
+        assert!(!char_accepted("店", "点", 6.0, 1.0));
+        // 脱字 (「すると[い]うような」)
+        assert!(char_accepted("", "い", 5.0, 4.0));
+        assert!(!char_accepted("", "い", 3.5, 4.0));
+        // かなの余分な字は大きく改善するときだけ。漢字・英字・括弧は消さない
+        assert!(char_accepted("れ", "", 9.0, 0.0));
+        assert!(!char_accepted("れ", "", 7.0, 0.0));
+        assert!(!char_accepted("再", "", 12.0, 8.0));
+        assert!(!char_accepted("A", "", 12.0, 8.0));
+        assert!(!char_accepted(")", "", 12.0, 8.0));
+        // 助詞どうしの置き換えは単語モデルに任せる
+        assert!(!char_accepted("の", "が", 9.0, 5.0));
+        assert!(char_accepted("れ", "て", 8.0, 0.0));
+        // 入れ替えはかな・漢字だけ
+        assert!(char_accepted("オデ", "デオ", 7.0, 0.0));
+        assert!(!char_accepted(")年", "年)", 7.0, 3.0));
     }
 
     #[test]

@@ -257,6 +257,27 @@ struct ModelArgs {
     /// カタカナ語の出現数の表 (scripts/katakana_lexicon.py)。カタカナ語の打ち間違いの検出に使う。無ければ使わない
     #[arg(long, default_value = "data/katakana.tsv")]
     katakana: PathBuf,
+    /// 文字単位の言語モデル (語の中の 1 字の誤りの検出)。無ければ使わない
+    #[arg(long, default_value = "data/charlm.bin")]
+    charlm: PathBuf,
+    /// 同じ読みの漢字の表 (文字単位の検出で漢字を置き換える候補)
+    #[arg(long, default_value = "data/kanji_homo.tsv")]
+    char_homo: PathBuf,
+    /// 文字単位の直しの採否の判定器 (scripts/charrank/ で作る)。無ければ直し方の種類ごとの下限で決める
+    #[arg(long, default_value = "data/charrank.tsv")]
+    char_rank: PathBuf,
+    /// 文字単位の検出: 1 つの位置から出す直しの数
+    #[arg(long, default_value_t = 3)]
+    char_top: usize,
+    /// 文字単位の検出: 置換・挿入で後ろの文脈まで採点する候補の数
+    #[arg(long, default_value_t = 6)]
+    char_beam: usize,
+    /// 文字単位の検出: この対数確率より低い文字の位置だけを調べる
+    #[arg(long, default_value_t = -3.0, allow_hyphen_values = true)]
+    char_susp: f32,
+    /// 文字単位の検出: 対数確率の改善幅がこれ以上の直しを候補にする (採否は直し方の種類ごとの下限で決める)
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
+    char_tau: f32,
     /// 採否の判定器 (train-rerank の出力)。無ければ種類ごとの閾値で決める
     #[arg(long, default_value = "data/rerank.tsv")]
     rerank: PathBuf,
@@ -381,6 +402,19 @@ impl ModelArgs {
         };
         let checker = if self.katakana.exists() {
             checker.with_katakana(celso::katakana::Katakana::load(&self.katakana)?)
+        } else {
+            checker
+        };
+        let checker = if self.charlm.exists() && self.char_homo.exists() {
+            let mut c = celso::charcheck::CharChecker::load(&self.charlm, &self.char_homo)?;
+            c.suspicious = self.char_susp;
+            c.min_delta = self.char_tau;
+            c.per_position = self.char_top;
+            c.beam = self.char_beam;
+            if self.char_rank.exists() {
+                c = c.with_rank(celso::charcheck::CharRanker::load(&self.char_rank)?);
+            }
+            checker.with_charcheck(c)
         } else {
             checker
         };

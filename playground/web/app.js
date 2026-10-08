@@ -53,6 +53,11 @@ worker.onmessage = (e) => {
       statusText.textContent = `準備ができました (${(msg.ms / 1000).toFixed(1)} 秒)。入力すると自動で検査します。`;
       requestCheck(0);
       break;
+    case 'char-ready':
+      // 文字モデルが付いたので検査し直す (語の中の 1 字の誤りも出るようになる)
+      statusText.textContent += ` 文字モデルも読み込みました (${(msg.ms / 1000).toFixed(1)} 秒)。`;
+      requestCheck(0);
+      break;
     case 'result':
       if (msg.id < latestShownId) return;
       latestShownId = msg.id;
