@@ -202,6 +202,9 @@ enum Cmd {
         /// 一般文の閾値を「法令文の閾値 + δ」として δ を振り、検出率と誤検出率の表を出す
         #[arg(long)]
         sweep: bool,
+        /// 見逃した誤り (検出できなかった・直し方が違った) を CSV に書き出す (Excel で開けるよう BOM 付き)
+        #[arg(long)]
+        misses: Option<PathBuf>,
     },
 }
 
@@ -820,7 +823,17 @@ fn main() -> Result<()> {
             file,
             show,
             sweep,
-        } => eval_jwtd(m, file, show, sweep),
+            misses,
+        } => eval_jwtd(m, file, show, sweep, misses.as_deref()),
+    }
+}
+
+/// CSV の 1 欄 (カンマ・引用符・改行を含むときは引用符で囲む)。
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
 }
 
@@ -1334,7 +1347,13 @@ fn diff_span(pre: &[char], post: &[char]) -> (usize, usize) {
     (p, pre.len() - s)
 }
 
-fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize, sweep: bool) -> Result<()> {
+fn eval_jwtd(
+    m: ModelArgs,
+    file: PathBuf,
+    show: usize,
+    sweep: bool,
+    misses: Option<&Path>,
+) -> Result<()> {
     let mut checker = m.load()?;
     let legal = checker.cfg.thresholds.clone();
     if sweep {
@@ -1406,17 +1425,63 @@ fn eval_jwtd(m: ModelArgs, file: PathBuf, show: usize, sweep: bool) -> Result<()
     }
     let mut cats: std::collections::BTreeMap<String, [usize; 4]> = Default::default();
     let mut shown = 0;
+    let mut miss_csv = match misses {
+        Some(p) => {
+            let mut w = BufWriter::new(std::fs::File::create(p)?);
+            w.write_all("\u{feff}".as_bytes())?;
+            writeln!(w, "分類,状態,誤り,正しい,誤りの文脈,celso の指摘")?;
+            Some(w)
+        }
+        None => None,
+    };
     for (r, (fe, fc)) in recs.iter().zip(&res) {
         let pre: Vec<char> = r.pre.chars().collect();
         let post: Vec<char> = r.post.chars().collect();
         let (a, b) = diff_span(&pre, &post);
         let e = cats.entry(r.cat.clone()).or_default();
         e[0] += 1;
-        if fe.iter().any(|f| f.start <= b && a <= f.end) {
+        let detected = fe.iter().any(|f| f.start <= b && a <= f.end);
+        let corrected = fe.iter().any(|f| apply(&r.pre, f) == r.post);
+        if detected {
             e[1] += 1;
         }
-        if fe.iter().any(|f| apply(&r.pre, f) == r.post) {
+        if corrected {
             e[2] += 1;
+        }
+        if let Some(w) = miss_csv.as_mut()
+            && !corrected
+        {
+            let (_, pb) = diff_span(&post, &pre);
+            let wrong: String = pre[a..b].iter().collect();
+            let right: String = post[a..pb].iter().collect();
+            let lo = a.saturating_sub(15);
+            let hi = (b + 15).min(pre.len());
+            let ctx = format!(
+                "{}[{}]{}",
+                pre[lo..a].iter().collect::<String>(),
+                wrong,
+                pre[b..hi].iter().collect::<String>()
+            );
+            let ours = fe
+                .iter()
+                .map(|f| format!("「{}」→「{}」", f.original, f.replacement))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let state = if detected {
+                "位置は検出・直し方が違う"
+            } else {
+                "未検出"
+            };
+            writeln!(
+                w,
+                "{},{},{},{},{},{}",
+                csv_field(&r.cat),
+                state,
+                csv_field(&wrong),
+                csv_field(&right),
+                csv_field(&ctx),
+                csv_field(&ours)
+            )?;
         }
         e[3] += fc.len();
         for f in fc {

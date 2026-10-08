@@ -12,7 +12,7 @@ F = os.path.join(os.path.expanduser(os.environ.get('FRAIM_LINT_RS', '~/ghq/githu
 os.makedirs(f'{F}/src', exist_ok=True)
 os.makedirs(f'{F}/tests/regression', exist_ok=True)
 
-for f in ['lm', 'checker', 'norm', 'cooc', 'patterns', 'rerank', 'bundle']:
+for f in ['lm', 'checker', 'norm', 'cooc', 'patterns', 'rerank', 'bundle', 'katakana']:
     shutil.copy(f'{C}/src/{f}.rs', f'{F}/src/{f}.rs')
 # MLM (candle) は持ち込まない。checker のコードを celso と揃えるため、値を作れない代替を mlm.rs として置く
 shutil.copy(f'{C}/src/mlm_stub.rs', f'{F}/src/mlm.rs')
