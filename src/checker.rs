@@ -425,10 +425,11 @@ impl Checker {
         let found = self.check(text);
         let normalized = norm(text);
         let chars: Vec<char> = normalized.chars().collect();
-        found
+        let found: Vec<Finding> = found
             .into_iter()
             .filter(|f| self.doc_repeats(&normalized, &chars, f, 0) < self.cfg.doc_repeat_limit)
-            .collect()
+            .collect();
+        drop_old_style_small_kana(found)
     }
 
     /// 複数のテキストをまとめて検査する。MLM の採点要求を全テキスト分まとめて大きなバッチで流すので、
@@ -1461,7 +1462,7 @@ impl Checker {
             }
             // 「ユーザもベンダも」「AやB」のような並列は、片方を消したり言い換えたりしても文が成立するので
             // n-gram では誤りに見えやすい。並列の「も」は削除・置換の対象から外す
-            let parallel = is_parallel_mo(toks, i);
+            let parallel = is_parallel_mo(toks, i) || is_parallel_to(toks, i);
             // 「にも」「については」「ベンダからは」のように、格助詞に係助詞「は」「も」が続く形は
             // どちらを消しても文が成立するので、n-gram では誤りに見えやすい (契約書の誤検出で多かった)。
             // 係助詞側と、「からは」「では」「とも」「よりは」の格助詞側を削除の対象から外す。
@@ -1475,9 +1476,11 @@ impl Checker {
                 && toks.get(i + 1).is_some_and(is_kakari);
             // 「次回までに」「月末までに」の「までに」は期限を表す一続きの言い方なので、「まで」を消す候補にしない
             // (「西口側までは」の「まで」は消す候補に残す)
+            // 「違反したとまではいえない」の「まで」は強調 (「とまで」) なので消さない
+            let emphatic_made = t.surface == "まで" && i > 0 && toks[i - 1].surface == "と";
             let deadline_madeni =
                 t.surface == "まで" && toks.get(i + 1).is_some_and(|x| x.surface == "に");
-            let no_delete = after_particle || before_kakari || deadline_madeni;
+            let no_delete = after_particle || before_kakari || deadline_madeni || emphatic_made;
             if (is_simple_particle || is_hira1 || dup) && !parallel && !no_delete {
                 out.push(Cand {
                     a: i,
@@ -1935,6 +1938,42 @@ fn touches_space(toks: &[Token], a: usize, b: usize) -> bool {
 }
 
 /// toks[i] が「A も B も」の並列の「も」か (同じ文の近く (前後 6 語以内) に別の「も」がある)。
+/// 古い表記 (促音・拗音を小さく書かない「あつた」「なつた」) を直す指摘のうち、文書の中で 2 か所以上あるものは
+/// 書き手の表記として出さない (古い判決の要旨などで、文書全体がこの表記になっている)。1 か所だけなら打ち間違いとして残す。
+fn drop_old_style_small_kana(found: Vec<Finding>) -> Vec<Finding> {
+    let is_small_kana_fix = |f: &Finding| {
+        matches!(
+            (f.original.as_str(), f.replacement.as_str()),
+            ("つ", "っ") | ("や", "ゃ") | ("ゆ", "ゅ") | ("よ", "ょ")
+        )
+    };
+    if found.iter().filter(|f| is_small_kana_fix(f)).count() < 2 {
+        return found;
+    }
+    found
+        .into_iter()
+        .filter(|f| !is_small_kana_fix(f))
+        .collect()
+}
+
+/// 並列の「と」(「代金と費用とを」「発症と事故との間」)。近くにもう 1 つ「と」があり、間に句読点が無いもの。
+/// どちらの「と」を消しても文が成立するので、n-gram では誤りに見えやすい (判決文の要旨で誤検出が多かった)。
+fn is_parallel_to(toks: &[Token], i: usize) -> bool {
+    let is_to = |t: &Token| t.surface == "と" && t.pos == "助詞";
+    if !is_to(&toks[i]) {
+        return false;
+    }
+    let lo = i.saturating_sub(6);
+    let hi = (i + 7).min(toks.len());
+    (lo..hi).any(|j| {
+        j != i
+            && is_to(&toks[j])
+            && !toks[j.min(i)..j.max(i)]
+                .iter()
+                .any(|t| matches!(t.surface.as_str(), "。" | "、"))
+    })
+}
+
 fn is_parallel_mo(toks: &[Token], i: usize) -> bool {
     let is_mo = |t: &Token| t.surface == "も" && t.pos == "助詞";
     if !is_mo(&toks[i]) {
@@ -2368,6 +2407,39 @@ mod tests {
         assert_eq!(fixes("違反を是正する。"), []);
         assert_eq!(fixes("従事を命じる。"), []);
         assert_eq!(fixes("部下を従える。"), []);
+    }
+
+    #[test]
+    fn parallel_to_and_emphatic_made_are_not_deleted() {
+        let Ok(c) = tiny_checker() else { return };
+        // 並列の「と」(「AとBとを」「AとBとの間」) はどちらも消さない
+        let t = toks("代金と費用とを提供した。");
+        assert!(!has_delete(&c, &t, "と"));
+        let t = toks("発症と事故との間に因果関係がある。");
+        assert!(!has_delete(&c, &t, "と"));
+        // 「〜とまで」の「まで」は強調なので消さない
+        let t = toks("違反したとまでいうことはできない。");
+        assert!(!has_delete(&c, &t, "まで"));
+        // 並列でない「と」は従来どおり消す候補にする
+        let t = toks("彼と話した。");
+        assert!(has_delete(&c, &t, "と"));
+    }
+
+    #[test]
+    fn old_style_large_tsu_is_kept_when_used_throughout_the_document() {
+        let f = |start: usize| Finding {
+            start,
+            end: start + 1,
+            original: "つ".into(),
+            replacement: "っ".into(),
+            kind: EditKind::Pattern,
+            delta: 1.0,
+            alternatives: Vec::new(),
+        };
+        // 文書の中で 2 か所以上あれば、古い表記として指摘しない
+        assert!(drop_old_style_small_kana(vec![f(3), f(10)]).is_empty());
+        // 1 か所だけなら打ち間違いの可能性があるので残す
+        assert_eq!(drop_old_style_small_kana(vec![f(3)]).len(), 1);
     }
 
     #[test]
