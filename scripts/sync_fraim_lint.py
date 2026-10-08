@@ -186,8 +186,17 @@ print('post-fix done')
 s = rd('src/checker.rs')
 s = must_replace(s, 'trace: std::env::var_os("TYPO_LINT_TRACE").is_some(),',
                  'trace: cfg!(feature = "trace") && std::env::var_os("TYPO_LINT_TRACE").is_some(),')
-s = must_replace(s, '''    /// TYPO_LINT_TRACE が設定されていれば、閾値に届かなかった候補も含めて採点の内訳を stderr へ出す
-    /// (ケースの調査用。組み込み先では設定しない)''', '''    /// `trace` feature 付きのビルドで TYPO_LINT_TRACE が設定されていれば、閾値に届かなかった候補も含めて
+s = must_replace(s, '''    /// `TYPO_LINT_TRACE` が設定されていれば、閾値に届かなかった候補も含めて採点の内訳を stderr へ出す
+    /// (ケースの調査用。組み込み先では設定しない)''', '''    /// `trace` feature 付きのビルドで `TYPO_LINT_TRACE` が設定されていれば、閾値に届かなかった候補も含めて
     /// 採点の内訳を stderr へ出す (ケースの調査用。文書の内容を出すので、組み込み先では feature を有効にしない)''')
 wr('src/checker.rs', s)
 print('trace gated')
+
+# trace を有効にしていないビルドで内訳が出ないことをテストで固定する
+s = rd("src/checker.rs")
+anchor = "    #[test]\n    fn mixed_kana_spelling_is_notation_variant() {"
+assert anchor in s, 'テストの挿入位置が見つからない'
+if 'trace_output_is_disabled_without_trace_feature' not in s:
+    s = s.replace(anchor, '\n    /// 採点の内訳 (文書の内容を含む) は、`trace` feature 付きのビルドでしか出さない。\n    #[cfg(not(feature = "trace"))]\n    #[test]\n    fn trace_output_is_disabled_without_trace_feature() {\n        // SAFETY: テスト内で環境変数を設定するだけ (他のテストはこの変数を読まない)\n        unsafe { std::env::set_var("TYPO_LINT_TRACE", "1") };\n        let Ok(c) = tiny_checker() else { return };\n        assert!(!c.trace);\n    }\n'.lstrip('\n') + '\n' + anchor, 1)
+wr("src/checker.rs", s)
+print('trace test added')
