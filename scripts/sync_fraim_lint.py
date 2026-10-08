@@ -12,7 +12,7 @@ F = os.path.join(os.path.expanduser(os.environ.get('FRAIM_LINT_RS', '~/ghq/githu
 os.makedirs(f'{F}/src', exist_ok=True)
 os.makedirs(f'{F}/tests/regression', exist_ok=True)
 
-for f in ['lm', 'checker', 'norm', 'cooc', 'patterns', 'rerank', 'bundle', 'katakana']:
+for f in ['lm', 'checker', 'norm', 'cooc', 'patterns', 'rerank', 'bundle', 'katakana', 'charcheck']:
     shutil.copy(f'{C}/src/{f}.rs', f'{F}/src/{f}.rs')
 # MLM (candle) は持ち込まない。checker のコードを celso と揃えるため、値を作れない代替を mlm.rs として置く
 shutil.copy(f'{C}/src/mlm_stub.rs', f'{F}/src/mlm.rs')
@@ -200,3 +200,13 @@ if 'trace_output_is_disabled_without_trace_feature' not in s:
     s = s.replace(anchor, '\n    /// 採点の内訳 (文書の内容を含む) は、`trace` feature 付きのビルドでしか出さない。\n    #[cfg(not(feature = "trace"))]\n    #[test]\n    fn trace_output_is_disabled_without_trace_feature() {\n        // SAFETY: テスト内で環境変数を設定するだけ (他のテストはこの変数を読まない)\n        unsafe { std::env::set_var("TYPO_LINT_TRACE", "1") };\n        let Ok(c) = tiny_checker() else { return };\n        assert!(!c.trace);\n    }\n'.lstrip('\n') + '\n' + anchor, 1)
 wr("src/checker.rs", s)
 print('trace test added')
+
+# 文字モデル (charcheck.rs)
+s = rd('src/charcheck.rs')
+s = s.replace('"celso-charcheck-', '"typo-lint-charcheck-')
+wr('src/charcheck.rs', s)
+s = rd('src/lib.rs')
+if 'pub mod charcheck;' not in s:
+    s = must_replace(s, 'pub mod bundle;', 'pub mod bundle;\npub mod charcheck;')
+    wr('src/lib.rs', s)
+print('charcheck synced')
