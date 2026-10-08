@@ -72,6 +72,16 @@ done
 # 契約書は小さい (約 180 万字) ので 10 倍の重みで数える (30 倍では契約書での誤検出が増えた)
 INPUTS=(data/corpus/egov.wc data/corpus/wiki1.wc data/corpus/reiki.wc)
 for i in $(seq 1 10); do INPUTS+=(data/corpus/contracts2.wc); done
+# 判例要旨 (任意): 社内で保有するデータで、このリポジトリには含めない。1 行 1 件のテキストを
+# CELSO_HANREI_TEXT で渡すと、言語モデルと判定器の学習に加える (語彙・共起モデルは変えない)。
+# 判決文の要旨での誤検出が 1 万字あたり 8.1 → 3.3 件に減る (学習から除いた 3000 件)。3 倍の重みで数える
+LM_INPUTS=("${INPUTS[@]}")
+HANREI_DIR=data/corpus/hanrei
+if [ -n "${CELSO_HANREI_TEXT:-}" ]; then
+  python3 scripts/hanrei_split.py "$CELSO_HANREI_TEXT" $HANREI_DIR
+  $BIN tokenize --with-class < $HANREI_DIR/train.txt > $HANREI_DIR/train.wc
+  for i in 1 2 3; do LM_INPUTS+=($HANREI_DIR/train.wc); done
+fi
 cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
   | $BIN tokenize --inflections data/inflections.tsv --readings data/readings.tsv > /dev/null
 
@@ -79,7 +89,7 @@ cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
 $BIN vocab --size 10000 -o data/vocab10k.txt "${INPUTS[@]}"
 #    誤変換の候補にする同音異字の語を足す (約 5 千語、+0.7MB)
 python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv data/homo_words.txt > data/vocab.txt
-$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin "${INPUTS[@]}"
+$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin "${LM_INPUTS[@]}"
 # 8. 同音異字の判定に使う文内共起モデル (約 3.7MB)。手がかりの語は頻出 5 万語から選ぶ。
 #    集計 (data/cooc_stats.bin) を残しておくと、--top-k などを変えて作り直すときにコーパスを数え直さない
 $BIN vocab --size 50000 -o data/vocab50k.txt "${INPUTS[@]}"
@@ -126,7 +136,14 @@ python3 scripts/heldout_wiki2.py
 $BIN dump-rerank --aux-model data/func.bin --patterns none \
   --synth data/corpus/heldout_wiki2_train.txt:general:3000 --floor=0 -o data/rerank_train_wiki2.tsv
 # 足切り (n-gram の Δ) は 0。1 にすると、変換ミス・助詞の脱落の正解の 3 分の 1 ほどが判定器に届かなかった
-$BIN train-rerank data/rerank_train.tsv data/rerank_train_wiki2.tsv --floor=0 -o data/rerank.tsv
+RERANK_INPUTS=(data/rerank_train.tsv data/rerank_train_wiki2.tsv)
+# 判例要旨を使うときは、判決文の人工誤り (学習用の先頭 4 万件から 2000 件 x 5 種類) も足す
+if [ -n "${CELSO_HANREI_TEXT:-}" ]; then
+  $BIN dump-rerank --aux-model data/func.bin --patterns none \
+    --synth $HANREI_DIR/synth_src.txt:general:2000 --floor=0 -o data/rerank_train_hanrei.tsv
+  RERANK_INPUTS+=(data/rerank_train_hanrei.tsv)
+fi
+$BIN train-rerank "${RERANK_INPUTS[@]}" --floor=0 -o data/rerank.tsv
 # 閾値 (対数オッズ) は調整用データ (JWTD 先頭 5000 件・wiki2 test・一宮市・JEITA 大) で決めた値を書き込む:
 # 法令文 -1.5、一般文 0.0、契約書 0.5 (一般文は、誤字パターン・カタカナ語の検出を足したぶん厳しくして
 # 正しい文での誤検出を以前と同じ水準に保つ)
@@ -134,13 +151,19 @@ $BIN train-rerank data/rerank_train.tsv data/rerank_train_wiki2.tsv --floor=0 -o
 # 判定器を使わず種類ごとの閾値で決める。一般文の余計な助詞 (「西口側までは → は」) は判定器のスコアが
 # -1.2 前後に出るので、一般文の削除だけ閾値を -1.35 まで下げる。ただし名詞の間の「の」を消す候補
 # (「無料のシャトルバス」) は誤検出が多いので -0.5 にする (delete-gen)。どれも tests/regression で固定
-python3 - <<'PY'
+# 判例要旨を使うときは、一般文の同音異字を -0.6 に下げる (判決文に寄ったぶん Wikipedia の漢字誤変換の検出が
+# 38 → 34% に落ちたのを戻す。調整は JWTD 先頭 5000 件・判例要旨の dev で行った)
+HANREI=${CELSO_HANREI_TEXT:+1} python3 - <<'PY'
 p = 'data/rerank.tsv'
 lines = [l for l in open(p).read().split('\n') if not l.startswith(('#exempt', '#tau_kind'))]
 lines = ['#tau\t-1.5,0.0,0.5' if l.startswith('#tau\t') else l for l in lines]
 i = next(k for k, l in enumerate(lines) if l.startswith('#floor'))
-lines[i + 1:i + 1] = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.35,0.5',
-                      '#tau_kind\tdelete-gen\t-1.5,-0.5,0.5']
+extra = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.35,0.5',
+         '#tau_kind\tdelete-gen\t-1.5,-0.5,0.5']
+import os
+if os.environ.get('HANREI'):
+    extra.append('#tau_kind\thomophone\t-1.5,-0.6,0.5')
+lines[i + 1:i + 1] = extra
 open(p, 'w').write('\n'.join(lines))
 PY
 
