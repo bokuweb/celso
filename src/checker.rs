@@ -295,6 +295,8 @@ pub struct Checker {
     rerank: Option<crate::rerank::Reranker>,
     /// 実際の誤字から集めた書き換えパターン (無ければ使わない)
     patterns: Option<crate::patterns::Patterns>,
+    /// カタカナ語の出現数の表 (カタカナ語の打ち間違いの検出に使う。無ければ使わない)
+    katakana: Option<crate::katakana::Katakana>,
     /// 文単位の結果キャッシュ (正規化済みの文のハッシュ → その文の指摘)。
     /// 指摘は文の中身だけで決まる (文書内繰り返しの抑制は文書全体で毎回かけ直す) ので、
     /// 編集されていない文は再計算しなくてよい。
@@ -313,6 +315,21 @@ fn sentence_key(s: &str, d: Domain) -> u64 {
     s.hash(&mut h);
     d.hash(&mut h);
     h.finish()
+}
+
+/// 判定器の特徴量の材料 (候補ごとに scan で求めた値)。
+#[derive(Clone, Copy)]
+struct Signals {
+    /// n-gram の Δ
+    ngram: f32,
+    /// 文法モデルの Δ (助詞の削除・置換・補いだけ)
+    aux: Option<f32>,
+    /// 同音異字の共起の差 (同音異字だけ)
+    cooc: Option<f32>,
+    /// 編集箇所まわりの未出現の並びの数
+    novel: usize,
+    /// 文全体で未出現の並びになっている位置の割合 (崩れた文・コーパスに無い分野の文ほど大きい)
+    sent_novel: f32,
 }
 
 /// 修正候補。置き換え先は常に 1 語以下なので、借用した文字列 1 つで持つ (候補ごとの確保をなくす)。
@@ -342,6 +359,7 @@ impl Checker {
             aux: None,
             rerank: None,
             patterns: None,
+            katakana: None,
             cache: None,
             trace: std::env::var_os("CELSO_TRACE").is_some(),
         }
@@ -362,7 +380,14 @@ impl Checker {
         self
     }
 
-    /// 書き換えパターンの照合を使う。
+    /// カタカナ語の打ち間違いの検出を使う。
+    #[must_use]
+    pub fn with_katakana(mut self, katakana: crate::katakana::Katakana) -> Self {
+        self.katakana = Some(katakana);
+        self
+    }
+
+    /// 実際の誤字から集めた書き換えパターンを使う。
     #[must_use]
     pub fn with_patterns(mut self, patterns: crate::patterns::Patterns) -> Self {
         self.patterns = Some(patterns);
@@ -551,24 +576,30 @@ impl Checker {
             let found = p.find(sent);
             if !found.is_empty() {
                 // パターンは前後の文脈を見ないので (「なってしまします → しまいます」は正しいが
-                // 「いたしまします」には当てはまらない)、直した文の n-gram の尤度が大きく下がるものは捨てる
+                // 「いたしまします」には当てはまらない)、直した文の n-gram の尤度の改善幅とパターンの支持数で採否を決める
                 let base = self.sentence_logp(&ids);
                 for f in found {
                     let fixed = apply_finding(sent, &f);
-                    let d = self.sentence_logp(&self.ids_of(&self.tok.tokenize(&fixed))) - base;
+                    let sd = self.sentence_logp(&self.ids_of(&self.tok.tokenize(&fixed))) - base;
                     if self.trace {
                         eprintln!(
-                            "  [pattern] 「{}」→「{}」 文の Δ={d:.2}",
-                            f.original, f.replacement
+                            "  [pattern] 「{}」→「{}」 文の Δ={sd:.2} 支持={:.2}\t{fixed}",
+                            f.original, f.replacement, f.delta
                         );
                     }
-                    if d >= PATTERN_MIN_SENTENCE_DELTA {
+                    // スコアは採否にだけ使い、箇所の中での順位は支持数 (log10) のままにする
+                    // (スコアをそのまま使うと、同じ箇所の正しい活用の修正案より上に来てしまう)
+                    if pattern_accepted(d, sd, f.delta) {
                         cands.push(f);
                     }
                 }
             }
         }
+        if let Some(k) = &self.katakana {
+            cands.extend(k.find(sent));
+        }
         cands.extend(repeated_function_words(&toks));
+        cands.extend(wrong_case_before_ni_verbs(&toks));
         // 箇所にまとめる: 1 文字以内で隣り合う候補は同じ誤りの別解とみなす
         // (「飲食は店」の「は」を消す案と「店」を消す案など)
         cands.sort_by_key(|f| (f.start, f.end));
@@ -636,6 +667,7 @@ impl Checker {
         let mut repl_buf = [0u32; 1];
         // 未出現ゲートの判定は語の位置ごとに 1 回だけ行い、候補間で使い回す
         let novel = self.novel_positions(ids);
+        let sent_novel = novel.iter().filter(|v| **v).count() as f32 / novel.len().max(1) as f32;
         let mut cooc_ctx: Option<Vec<u32>> = None;
         let mut aux_ids: Option<(Vec<u32>, Vec<f32>)> = None;
         // 元の文の各位置の対数確率 (候補ごとに同じ値を計算し直さない)
@@ -737,8 +769,15 @@ impl Checker {
                     .filter(|v| **v)
                     .count()
             };
+            let signals = || Signals {
+                ngram,
+                aux: aux_delta,
+                cooc: cooc_term,
+                novel: nov(),
+                sent_novel,
+            };
             let feats = if dump {
-                Some(self.features(toks, &c, d, ngram, aux_delta, cooc_term, nov()))
+                Some(self.features(toks, &c, d, &signals()))
             } else {
                 None
             };
@@ -748,7 +787,15 @@ impl Checker {
                 delta = delta - self.base_threshold(c.kind, d) + r.tau_for(c.kind.label(), d);
             }
             if let Some(r) = rerank_here {
-                delta = self.rerank_score(r, toks, &c, d, ngram, aux_delta, cooc_term, nov());
+                delta = self.rerank_score(r, toks, &c, d, &signals());
+                // 名詞の間の「の」を消す候補は、他の削除と別の閾値 (`#tau_kind delete-gen`) で決める。
+                // 最後の採否は種類 (delete) の閾値で行うので、閾値の差だけ Δ をずらす
+                if c.kind == EditKind::Delete
+                    && c.b == c.a + 1
+                    && is_genitive_between_nouns(toks, c.a)
+                {
+                    delta += r.tau_for(c.kind.label(), d) - r.tau_for(DELETE_GENITIVE, d);
+                }
                 if self.trace {
                     self.trace_cand(
                         toks,
@@ -808,59 +855,50 @@ impl Checker {
     }
 
     /// 判定器の特徴量 (学習データの書き出し用に名前つきで集める)。
-    #[allow(clippy::too_many_arguments)]
     fn features(
         &self,
         toks: &[Token],
         c: &Cand<'_>,
         d: Domain,
-        ngram: f32,
-        aux: Option<f32>,
-        cooc: Option<f32>,
-        novel: usize,
+        sig: &Signals,
     ) -> crate::rerank::Features {
         let mut f: crate::rerank::Features = Vec::with_capacity(20);
-        self.emit_features(toks, c, d, ngram, aux, cooc, novel, &mut |k, v| {
-            f.push((k.to_string(), v))
-        });
+        self.emit_features(toks, c, d, sig, &mut |k, v| f.push((k.to_string(), v)));
         f
     }
 
     /// 判定器のスコア (特徴量の名前を確保せず、使い回しのバッファでハッシュを引く)。
-    #[allow(clippy::too_many_arguments)]
     fn rerank_score(
         &self,
         r: &crate::rerank::Reranker,
         toks: &[Token],
         c: &Cand<'_>,
         d: Domain,
-        ngram: f32,
-        aux: Option<f32>,
-        cooc: Option<f32>,
-        novel: usize,
+        sig: &Signals,
     ) -> f32 {
         let mut z = 0.0;
-        self.emit_features(toks, c, d, ngram, aux, cooc, novel, &mut |k, v| {
-            z += r.weight(k) * v
-        });
+        self.emit_features(toks, c, d, sig, &mut |k, v| z += r.weight(k) * v);
         z
     }
 
     /// 判定器の特徴量を 1 つずつ `emit(名前, 値)` に渡す。名前は「種類:内容」の形にして、
     /// 種類ごとに別の重みを持たせる。
-    #[allow(clippy::too_many_arguments)]
     fn emit_features(
         &self,
         toks: &[Token],
         c: &Cand<'_>,
         d: Domain,
-        ngram: f32,
-        aux: Option<f32>,
-        cooc: Option<f32>,
-        novel: usize,
+        sig: &Signals,
         emit: &mut dyn FnMut(&str, f32),
     ) {
         use std::fmt::Write as _;
+        let Signals {
+            ngram,
+            aux,
+            cooc,
+            novel,
+            sent_novel,
+        } = *sig;
         let k = c.kind.label();
         let bin = |x: f32| (x.floor() as i32).clamp(-2, 15);
         // 機能語 (助詞・助動詞・記号) は表層形、それ以外は品詞で表す
@@ -889,6 +927,8 @@ impl Checker {
         put(&mut buf, 1.0, emit);
         let _ = write!(buf, "{k}:nov{novel}");
         put(&mut buf, 1.0, emit);
+        let _ = write!(buf, "{k}:sn{}", ((sent_novel * 10.0) as i32).clamp(0, 10));
+        put(&mut buf, 1.0, emit);
         if let Some(a) = aux {
             let _ = write!(buf, "{k}:aux");
             put(&mut buf, a, emit);
@@ -915,6 +955,13 @@ impl Checker {
                 }
                 let _ = write!(buf, "{k}:r={repl}");
                 put(&mut buf, 1.0, emit);
+                if c.kind == EditKind::Delete
+                    && c.b == c.a + 1
+                    && is_genitive_between_nouns(toks, c.a)
+                {
+                    let _ = write!(buf, "{k}:gen_nn");
+                    put(&mut buf, 1.0, emit);
+                }
                 if c.kind == EditKind::Substitute {
                     let _ = write!(buf, "{k}:or=");
                     for t in &toks[c.a..c.b] {
@@ -932,7 +979,43 @@ impl Checker {
                     put(&mut buf, 1.0, emit);
                 }
             }
-            EditKind::Homophone | EditKind::Char | EditKind::Pattern => {}
+            EditKind::Homophone => {
+                if let Some(t) = toks.get(c.a) {
+                    // 同じ読みの語どうしの出現数の比 (よく使われる語への置き換えほど誤変換らしい)
+                    let count = |w: &str| {
+                        self.readings
+                            .get(t.reading)
+                            .and_then(|v| v.iter().find(|(x, _)| x == w))
+                            .map_or(0, |(_, n)| *n)
+                    };
+                    let freq =
+                        ((count(repl) as f32 + 1.0) / (count(&t.surface) as f32 + 1.0)).log10();
+                    let _ = write!(buf, "{k}:freq");
+                    put(&mut buf, freq, emit);
+                    let _ = write!(buf, "{k}:fb{}", bin(freq * 2.0));
+                    put(&mut buf, 1.0, emit);
+                    // 漢字を共有する組 (対象/対照) は打ち間違いが多く、共有しない組は意味の離れた別語のことが多い
+                    if t.surface
+                        .chars()
+                        .any(|ch| is_kanji(ch) && repl.contains(ch))
+                    {
+                        let _ = write!(buf, "{k}:share");
+                        put(&mut buf, 1.0, emit);
+                    }
+                    let _ = write!(buf, "{k}:len{}", t.surface.chars().count().min(4));
+                    put(&mut buf, 1.0, emit);
+                }
+            }
+            EditKind::Char | EditKind::Pattern => {}
+        }
+        // 元の語・置き換え先が言語モデルの語彙に無い (品詞クラスで採点している) か
+        if c.b == c.a + 1 && self.lm.word_id(toks[c.a].key()) == UNK {
+            let _ = write!(buf, "{k}:oov_o");
+            put(&mut buf, 1.0, emit);
+        }
+        if !repl.is_empty() && self.lm.word_id(repl) == UNK {
+            let _ = write!(buf, "{k}:oov_r");
+            put(&mut buf, 1.0, emit);
         }
         let prev = if c.a > 0 { toks.get(c.a - 1) } else { None };
         let next = toks.get(c.b);
@@ -1386,21 +1469,11 @@ impl Checker {
             let before_kakari = is_particle
                 && matches!(t.surface.as_str(), "から" | "で" | "と" | "より")
                 && toks.get(i + 1).is_some_and(is_kakari);
-            // 名詞と名詞をつなぐ「の」(「無料のシャトルバス」「宿泊の施設」) は、消しても残しても文が成立する。
-            // 複合語 (「無料シャトルバス」) の n-gram が強いと誤りに見えるが、実際の誤字ではほぼ起きないので消さない
-            let genitive_between_nouns = t.surface == "の"
-                && is_particle
-                && i > 0
-                && toks[i - 1].pos == "名詞"
-                && toks
-                    .get(i + 1)
-                    .is_some_and(|x| x.pos == "名詞" && !matches!(x.pos1, "非自立" | "接尾"));
             // 「次回までに」「月末までに」の「までに」は期限を表す一続きの言い方なので、「まで」を消す候補にしない
             // (「西口側までは」の「まで」は消す候補に残す)
             let deadline_madeni =
                 t.surface == "まで" && toks.get(i + 1).is_some_and(|x| x.surface == "に");
-            let no_delete =
-                after_particle || before_kakari || genitive_between_nouns || deadline_madeni;
+            let no_delete = after_particle || before_kakari || deadline_madeni;
             if (is_simple_particle || is_hira1 || dup) && !parallel && !no_delete {
                 out.push(Cand {
                     a: i,
@@ -1528,6 +1601,16 @@ impl Checker {
                     });
                 }
             }
+            if self.cfg.enable_insert {
+                for p in extra_insertions(toks, i) {
+                    out.push(Cand {
+                        a: i,
+                        b: i,
+                        repl: Some(p),
+                        kind: EditKind::Insert,
+                    });
+                }
+            }
         }
         out
     }
@@ -1629,6 +1712,73 @@ fn delta_pre(
 
 /// toks[a..b] の前後どちらかに、かな・漢字に挟まれた空白があるか。
 /// 「DX は」「第6 条」のような英数字の後ろの空白は Word の文書でも普通に書くので数えない。
+/// 引用・思考の動詞 (「…だと言う」「…と考える」の「と」が抜けやすい)。
+const QUOTE_VERBS: &[&str] = &[
+    "言う",
+    "いう",
+    "考える",
+    "思う",
+    "呼ぶ",
+    "述べる",
+    "語る",
+    "話す",
+    "答える",
+    "感じる",
+    "見る",
+    "称する",
+];
+
+/// 名詞の後ろ以外で、抜けやすい字を補う位置 (`toks[i]` の直前)。JWTD の開発用で、候補に入っていなかった
+/// 実際の誤字に多かった形だけを足す。
+/// - 「偽者だ□言う」「阻止する□いう目的」: 活用語の終止形と引用・思考の動詞の間の「と」
+/// - 「江戸時代に□みられない」: 格助詞の後ろの係助詞「は」「も」
+/// - 「普及□、」「辞任□、」: サ変名詞と読点の間の「し」
+/// - 「されて□ない」: 「て」と「ない」の間の「い」(い抜き)
+fn extra_insertions(toks: &[Token], i: usize) -> &'static [&'static str] {
+    let Some(prev) = i.checked_sub(1).map(|j| &toks[j]) else {
+        return &[];
+    };
+    let t = &toks[i];
+    if matches!(prev.pos, "動詞" | "助動詞" | "形容詞")
+        && prev.conj_form == "基本形"
+        && t.pos == "動詞"
+        && QUOTE_VERBS.contains(&t.base)
+    {
+        return &["と"];
+    }
+    if prev.pos == "助詞"
+        && prev.pos1 == "格助詞"
+        && matches!(prev.surface.as_str(), "に" | "で" | "まで" | "から" | "へ")
+        && !matches!(t.pos, "助詞" | "記号" | "助動詞")
+    {
+        return &["は", "も"];
+    }
+    if prev.pos == "名詞" && prev.pos1 == "サ変接続" && t.pos == "記号" && t.pos1 == "読点"
+    {
+        return &["し"];
+    }
+    // IPADIC は「されてない」の「て」を「てる」の未然形 (動詞・非自立) にする
+    let te = matches!(prev.surface.as_str(), "て" | "で")
+        && (prev.pos == "助詞" || (prev.pos1 == "非自立" && matches!(prev.base, "てる" | "でる")));
+    if te && t.base == "ない" {
+        return &["い"];
+    }
+    &[]
+}
+
+/// 名詞と名詞をつなぐ「の」(「無料のシャトルバス」「宿泊の施設」) か。消しても残しても文が成立するので、
+/// 複合語 (「無料シャトルバス」) の n-gram が強いと誤りに見えやすい。ただし実際の誤字 (JWTD) にも余計な「の」は
+/// 多い (開発用 4,883 文で 107 件) ので、候補からは外さず判定器の特徴量にする。
+fn is_genitive_between_nouns(toks: &[Token], i: usize) -> bool {
+    toks[i].surface == "の"
+        && toks[i].pos == "助詞"
+        && i > 0
+        && toks[i - 1].pos == "名詞"
+        && toks
+            .get(i + 1)
+            .is_some_and(|x| x.pos == "名詞" && !matches!(x.pos1, "非自立" | "接尾"))
+}
+
 /// 同じ助詞・接頭辞が 2 つ続く打ち間違い (「土産物はは店」「ごご連絡」) を、2 つ目を消す指摘にする。
 ///
 /// 助詞や接頭辞がそのまま 2 回続く正しい文はほぼ無い (「もも」「ここ」のような語は名詞として 1 語になる) ので、
@@ -1654,12 +1804,31 @@ fn repeated_function_words(toks: &[Token]) -> Vec<Finding> {
         .collect()
 }
 
+/// 判定器の `#tau_kind` に書く、名詞の間の「の」を消す候補の名前 (他の削除より厳しい閾値にする)。
+pub const DELETE_GENITIVE: &str = "delete-gen";
+
 /// 判定器の `#exempt` に書く、「活用語 + 推量の助動詞」をまとめて直す活用の候補の名前。
 pub const INFLECTION_AUX: &str = "inflection-aux";
 
-/// パターンの指摘を残す、直した文の n-gram 対数確率 (log10) の改善幅の下限。
-/// JWTD の開発用 (先頭 5000 件) で、検出率をほぼ落とさずに誤検出が減る値 (-6: 検出 34.1→34.0%、誤検出 8.7→8.5%/文)。
-const PATTERN_MIN_SENTENCE_DELTA: f32 = -6.0;
+/// パターンの採否のスコア = 直した文の n-gram 対数確率 (log10) の改善幅 + この重み × log10(支持数)。
+/// 支持数の多いパターン (「をを」「れいる」) は文脈が多少不自然でも採り、支持数の少ないものは改善幅で確かめる。
+const PATTERN_SUPPORT_WEIGHT: f32 = 4.0;
+/// パターンの指摘を残すスコアの下限 [法令文, 一般文, 契約書]。
+/// 一般文は JWTD の開発用 (先頭 5000 件) で、正しい文での誤検出を増やさずに検出が最も伸びる値。
+/// 法令文・契約書は、支持数の少ないパターンが例規・契約書の言い回しに当たりやすいので厳しめにする
+/// (一宮市・JEITA 大の原文での誤検出を増やさない値)。
+const PATTERN_MIN_SCORE: [f32; 3] = [5.0, 3.5, 5.0];
+
+/// パターンの指摘を採るか (`log_support` は log10(支持数))。
+fn pattern_accepted(d: Domain, sentence_delta: f32, log_support: f32) -> bool {
+    let score = sentence_delta + PATTERN_SUPPORT_WEIGHT * log_support;
+    let min = PATTERN_MIN_SCORE[match d {
+        Domain::Legal => 0,
+        Domain::General => 1,
+        Domain::Contract => 2,
+    }];
+    score >= min
+}
 
 fn apply_finding(sent: &str, f: &Finding) -> String {
     let mut out = String::with_capacity(sent.len());
@@ -1673,6 +1842,57 @@ fn apply_finding(sent: &str, f: &Finding) -> String {
     }
     if f.start >= sent.chars().count() {
         out.push_str(&f.replacement);
+    }
+    out
+}
+
+/// 必ず「に」をとる動詞 (原形)。「資料を基づき」「業務を従事する」の「を」は誤り。
+const NI_VERBS: &[&str] = &[
+    "基づく",
+    "従う",
+    "関する",
+    "対する",
+    "応じる",
+    "準じる",
+    "準ずる",
+    "反する",
+    "属する",
+];
+/// 必ず「に」をとるサ変名詞 (「〜する」の形で使うとき)。
+const NI_SURU_NOUNS: &[&str] = &[
+    "従事", "該当", "違反", "貢献", "依存", "起因", "準拠", "抵触", "寄与", "参画",
+];
+
+/// 「に」をとる動詞の直前の「を」を「に」に直す (「資料を基づき」「業務を従事する」「指示を従う」)。
+///
+/// 動詞が決まれば格助詞も決まる (文法の事実) ので、n-gram や判定器を通さずに出す。判定器は助詞の
+/// 置き換えを全般に嫌うので、n-gram の差が大きくても落とすことがあった。
+fn wrong_case_before_ni_verbs(toks: &[Token]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if t.surface != "を" || t.pos != "助詞" {
+            continue;
+        }
+        let Some(next) = toks.get(i + 1) else {
+            continue;
+        };
+        let verb = next.pos == "動詞" && NI_VERBS.contains(&next.base);
+        let suru_noun = next.pos == "名詞"
+            && NI_SURU_NOUNS.contains(&next.surface.as_str())
+            && toks
+                .get(i + 2)
+                .is_some_and(|x| x.pos == "動詞" && x.base == "する");
+        if verb || suru_noun {
+            out.push(Finding {
+                start: t.start,
+                end: t.end,
+                original: t.surface.clone(),
+                replacement: "に".to_string(),
+                kind: EditKind::Pattern,
+                delta: REPEATED_WORD_SCORE,
+                alternatives: Vec::new(),
+            });
+        }
     }
     out
 }
@@ -1931,10 +2151,27 @@ mod tests {
     }
 
     #[test]
-    fn genitive_no_between_nouns_is_not_deleted() {
+    fn genitive_no_between_nouns_is_a_reranker_feature() {
         let Ok(c) = tiny_checker() else { return };
         let t = toks("駅から無料のシャトルバスが出る。");
-        assert!(!has_delete(&c, &t, "の"));
+        // 候補には残し (実際の誤字にも余計な「の」は多い)、判定器に「名詞の間の『の』」と伝える
+        assert!(has_delete(&c, &t, "の"));
+        let i = index_of(&t, "の", 0);
+        let cand = Cand {
+            a: i,
+            b: i + 1,
+            repl: None,
+            kind: EditKind::Delete,
+        };
+        let sig = Signals {
+            ngram: 1.0,
+            aux: None,
+            cooc: None,
+            novel: 1,
+            sent_novel: 0.0,
+        };
+        let f = c.features(&t, &cand, Domain::General, &sig);
+        assert!(f.iter().any(|(k, _)| k == "delete:gen_nn"), "{f:?}");
         // 動詞の後ろの余計な「の」(「課するのもの」) は従来どおり消す候補にする
         let t = toks("個人に対して課するのものとする。");
         assert!(has_delete(&c, &t, "の"));
@@ -1967,6 +2204,23 @@ mod tests {
     }
 
     #[test]
+    fn pattern_acceptance_weighs_sentence_delta_and_support() {
+        let g = Domain::General;
+        // 支持数 1000 件 (log10 = 3) なら、文の尤度が少し下がっても採る
+        assert!(pattern_accepted(g, -2.0, 3.0));
+        // 支持数 2 件 (log10 ≒ 0.3) は、文の尤度が十分に上がるときだけ採る
+        assert!(!pattern_accepted(g, 1.0, 0.3));
+        assert!(pattern_accepted(g, 3.0, 0.3));
+        // 「いたしまします → いたしまいます」(文の Δ が大きく負) はどの文書でも捨てる
+        assert!(!pattern_accepted(g, -12.0, 0.78));
+        assert!(!pattern_accepted(Domain::Legal, -12.0, 0.78));
+        // 法令文・契約書は一般文より厳しい
+        assert!(pattern_accepted(g, 4.0, 0.0));
+        assert!(!pattern_accepted(Domain::Legal, 4.0, 0.0));
+        assert!(pattern_accepted(Domain::Contract, 0.0, 1.5));
+    }
+
+    #[test]
     fn apply_finding_replaces_by_char_offsets() {
         let f = |start, end, r: &str| Finding {
             start,
@@ -1985,6 +2239,87 @@ mod tests {
             apply_finding("目的としてい", &f(6, 6, "る")),
             "目的としている"
         );
+    }
+
+    #[test]
+    fn homophone_features_include_frequency_prior_and_shared_kanji() {
+        let Ok(mut c) = tiny_checker() else { return };
+        let t = toks("対象を比較する。");
+        let reading = t[0].reading;
+        assert!(!reading.is_empty());
+        // 「対照」は「対象」より 10 倍少ない
+        c.readings.insert(
+            reading.to_string(),
+            vec![("対象".into(), 1000), ("対照".into(), 99)],
+        );
+        let cand = Cand {
+            a: 0,
+            b: 1,
+            repl: Some("対照"),
+            kind: EditKind::Homophone,
+        };
+        let sig = Signals {
+            ngram: 1.0,
+            aux: None,
+            cooc: None,
+            novel: 1,
+            sent_novel: 0.25,
+        };
+        let f = c.features(&t, &cand, Domain::General, &sig);
+        let get = |name: &str| f.iter().find(|(k, _)| k == name).map(|(_, v)| *v);
+        // log10((99+1)/(1000+1)) ≒ -1
+        assert!((get("homophone:freq").unwrap() + 1.0).abs() < 0.01, "{f:?}");
+        assert_eq!(get("homophone:share"), Some(1.0));
+        assert_eq!(get("homophone:sn2"), Some(1.0));
+    }
+
+    fn has_insert(c: &Checker, t: &[Token], before: &str, repl: &str) -> bool {
+        let i = index_of(t, before, 0);
+        c.candidates(t)
+            .iter()
+            .any(|x| x.a == i && x.b == i && x.kind == EditKind::Insert && x.repl == Some(repl))
+    }
+
+    #[test]
+    fn inserts_common_missing_characters_outside_noun_positions() {
+        let Ok(c) = tiny_checker() else { return };
+        // 引用の「と」
+        let t = toks("彼が偽者だ言う場面がある。");
+        assert!(has_insert(&c, &t, "言う", "と"));
+        // 格助詞の後ろの「は」
+        let t = toks("江戸時代にみられない。");
+        assert!(has_insert(&c, &t, "み", "は"));
+        // サ変名詞と読点の間の「し」
+        let t = toks("技術が急速に発展、世界に広まった。");
+        assert!(has_insert(&c, &t, "、", "し"));
+        // い抜き
+        let t = toks("まだ公開されてない。");
+        assert!(has_insert(&c, &t, "ない", "い"));
+        // 正しい形には余計な候補を出さない (「と言う」の「と」の後ろに「と」は補わない)
+        let t = toks("彼が偽者だと言う。");
+        assert!(!has_insert(&c, &t, "言う", "と"));
+    }
+
+    #[test]
+    fn wo_before_verbs_that_take_ni_is_replaced() {
+        let fixes = |s: &str| -> Vec<(usize, String)> {
+            wrong_case_before_ni_verbs(&toks(s))
+                .into_iter()
+                .map(|f| (f.start, f.replacement))
+                .collect()
+        };
+        assert_eq!(fixes("資料を基づき説明した。"), [(2, "に".to_string())]);
+        assert_eq!(
+            fixes("他の業務を従事してはならない。"),
+            [(4, "に".to_string())]
+        );
+        assert_eq!(fixes("甲の指示を従う。"), [(4, "に".to_string())]);
+        assert_eq!(fixes("法令を違反した。"), [(2, "に".to_string())]);
+        // 正しい文や、サ変名詞が「する」を伴わない形には出さない
+        assert!(fixes("資料に基づき説明した。").is_empty());
+        assert!(fixes("違反を是正する。").is_empty());
+        assert!(fixes("従事を命じる。").is_empty());
+        assert!(fixes("部下を従える。").is_empty());
     }
 
     #[test]

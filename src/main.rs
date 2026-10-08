@@ -251,6 +251,9 @@ struct ModelArgs {
     /// 実際の誤字から集めた書き換えパターン (scripts/patterns/)。無ければ使わない
     #[arg(long, default_value = "data/patterns.tsv")]
     patterns: PathBuf,
+    /// カタカナ語の出現数の表 (scripts/katakana_lexicon.py)。カタカナ語の打ち間違いの検出に使う。無ければ使わない
+    #[arg(long, default_value = "data/katakana.tsv")]
+    katakana: PathBuf,
     /// 採否の判定器 (train-rerank の出力)。無ければ種類ごとの閾値で決める
     #[arg(long, default_value = "data/rerank.tsv")]
     rerank: PathBuf,
@@ -370,6 +373,11 @@ impl ModelArgs {
         };
         let checker = if self.patterns.exists() {
             checker.with_patterns(celso::patterns::Patterns::load(&self.patterns)?)
+        } else {
+            checker
+        };
+        let checker = if self.katakana.exists() {
+            checker.with_katakana(celso::katakana::Katakana::load(&self.katakana)?)
         } else {
             checker
         };

@@ -102,6 +102,10 @@ DOMAIN=(data/corpus/egov.txt data/corpus/reiki.f.txt); for i in $(seq 1 10); do 
 $BIN count-patterns data/patterns_sel4.tsv -o data/patterns_domain.tsv "${DOMAIN[@]}"
 python3 scripts/patterns/filter.py data/patterns_domain.tsv data/patterns.tsv
 
+# 10b. カタカナ語の出現数 (カタカナ語の打ち間違いの検出。src/katakana.rs)
+python3 scripts/katakana_lexicon.py data/katakana.tsv \
+  data/corpus/wiki1.txt data/corpus/egov.txt data/corpus/reiki.f.txt data/corpus/contracts2.txt
+
 # 11. 判定器 (ロジスティック回帰)。学習には評価に使わない文書だけを使う:
 #     学習に入れていない 2 自治体 (一宮市・高槻市) の例規、JEITA モデル契約 (大、調整用)、JWTD train (先頭 5000 件は開発用に除く)
 python3 scripts/fetch_reiki.py --all --sites 高槻市,加古川市,一宮市,生駒市 --max-pages 150 \
@@ -115,27 +119,31 @@ tail -n +5001 data/jwtd/train.jsonl > data/jwtd/train_rest.jsonl
 $BIN dump-rerank --aux-model data/func.bin --patterns none \
   --synth data/corpus/heldout_一宮市.txt:legal:600 --synth data/corpus/heldout_高槻市.txt:legal:600 \
   --synth data/eval_contracts/jeita_dev.reflow.txt:contract:600 \
-  --jwtd data/jwtd/train_rest.jsonl --jwtd-limit 30000 --floor 1.0 -o data/rerank_train.tsv
+  --jwtd data/jwtd/train_rest.jsonl --jwtd-limit 30000 --floor=0 -o data/rerank_train.tsv
 # 一般文の人工誤り (Wikipedia の 2 本目のダンプ。言語モデルには入れていない) も足す。JWTD だけだと
 # 一般文の余計な助詞 (「土産物から店」) の正例が少なく、判定器が助詞の削除を強く嫌う
 python3 scripts/heldout_wiki2.py
 $BIN dump-rerank --aux-model data/func.bin --patterns none \
-  --synth data/corpus/heldout_wiki2_train.txt:general:3000 --floor 1.0 -o data/rerank_train_wiki2.tsv
-$BIN train-rerank data/rerank_train.tsv data/rerank_train_wiki2.tsv -o data/rerank.tsv
+  --synth data/corpus/heldout_wiki2_train.txt:general:3000 --floor=0 -o data/rerank_train_wiki2.tsv
+# 足切り (n-gram の Δ) は 0。1 にすると、変換ミス・助詞の脱落の正解の 3 分の 1 ほどが判定器に届かなかった
+$BIN train-rerank data/rerank_train.tsv data/rerank_train_wiki2.tsv --floor=0 -o data/rerank.tsv
 # 閾値 (対数オッズ) は調整用データ (JWTD 先頭 5000 件・wiki2 test・一宮市・JEITA 大) で決めた値を書き込む:
-# 法令文 -1.5、一般文 -0.5、契約書 0.5
+# 法令文 -1.5、一般文 0.0、契約書 0.5 (一般文は、誤字パターン・カタカナ語の検出を足したぶん厳しくして
+# 正しい文での誤検出を以前と同じ水準に保つ)
 # 活用の誤り (「多くあろう → ある」) は JWTD の言い換え (〜であろう) に引きずられて判定器が強く負に振れるので、
 # 判定器を使わず種類ごとの閾値で決める。一般文の余計な助詞 (「西口側までは → は」) は判定器のスコアが
-# -1.0 前後に出るので、一般文の削除だけ閾値を -1.2 まで下げる (tests/regression で固定)
+# -1.2 前後に出るので、一般文の削除だけ閾値を -1.35 まで下げる。ただし名詞の間の「の」を消す候補
+# (「無料のシャトルバス」) は誤検出が多いので -0.5 にする (delete-gen)。どれも tests/regression で固定
 python3 - <<'PY'
 p = 'data/rerank.tsv'
 lines = [l for l in open(p).read().split('\n') if not l.startswith(('#exempt', '#tau_kind'))]
-lines = ['#tau\t-1.5,-0.5,0.5' if l.startswith('#tau\t') else l for l in lines]
+lines = ['#tau\t-1.5,0.0,0.5' if l.startswith('#tau\t') else l for l in lines]
 i = next(k for k, l in enumerate(lines) if l.startswith('#floor'))
-lines[i + 1:i + 1] = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.2,0.5']
+lines[i + 1:i + 1] = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.35,0.5',
+                      '#tau_kind\tdelete-gen\t-1.5,-0.5,0.5']
 open(p, 'w').write('\n'.join(lines))
 PY
 
 # 12. 活用表・同音異字表をモデルの語彙で絞る (配布物は data/dist/)
 $BIN prune-tables --model data/model.bin -o data/dist
-cp data/model.bin data/cooc.bin data/func.bin data/rerank.tsv data/patterns.tsv data/dist/
+cp data/model.bin data/cooc.bin data/func.bin data/rerank.tsv data/patterns.tsv data/katakana.tsv data/dist/

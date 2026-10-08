@@ -1,8 +1,11 @@
 """誤字パターンの候補から、誤検出しにくいものを選ぶ (extract.py → celso count-patterns → これ)。
 
 基準:
-  - train での支持数が min_support 以上 (偶然の 1 件を拾わない)
+  - train での支持数が min_support 以上 (偶然の 1 件を拾わない。抽出の時点で 2 件以上に絞っている)
   - コーパス (法令・例規・契約書・Wikipedia) で、誤り側の出現が正しい側の 1/ratio 以下
+支持数の少ないパターンは文脈によって当たり外れがあるので、検査時に直した文の n-gram の改善幅と
+支持数で採否を決める (src/checker.rs の pattern_accepted)。そのぶんここでは広めに採る
+(支持数 3・比 200 から 2・50 にして、JWTD の開発用で検出 +3pt、誤検出は採否の絞り込みで相殺)。
     (正しい文でもよく使う書き方なら、誤りとは言えない)
   - 文脈の幅が違う同じ書き換えのうち、条件を満たす一番短いものだけを残す (表を小さく、照合を速く)
 
@@ -11,7 +14,7 @@ JWTD (CC BY-SA 3.0) から作るので、出力も CC BY-SA 3.0 で扱う。
 """
 import sys
 
-def main(src, out, min_support=3, ratio=200, max_wrong=50, min_right=10):
+def main(src, out, min_support=2, ratio=50, max_wrong=50, min_right=10):
     rows = []
     for line in open(src, encoding='utf-8'):
         p = line.rstrip('\n').split('\t')

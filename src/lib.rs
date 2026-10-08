@@ -1,6 +1,7 @@
 pub mod bundle;
 pub mod checker;
 pub mod cooc;
+pub mod katakana;
 pub mod lm;
 #[cfg(feature = "mlm")]
 pub mod mlm;

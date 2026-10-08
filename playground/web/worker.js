@@ -15,6 +15,7 @@ const ASSETS = [
   ['func', 'assets/func.bin.gz'],
   ['rerank', 'assets/rerank.tsv.gz'],
   ['patterns', 'assets/patterns.tsv.gz'],
+  ['katakana', 'assets/katakana.tsv.gz'],
 ];
 
 let playground = null;
@@ -84,6 +85,7 @@ async function load() {
     f.func,
     f.rerank,
     f.patterns,
+    f.katakana,
   );
   post('ready', { ms: Math.round(performance.now() - started) });
 }

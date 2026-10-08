@@ -45,6 +45,7 @@ fn detects_the_example_sentence_with_pure_rust_tokenizer() {
         func: &read(&dist, "func.bin"),
         rerank: &read(&dist, "rerank.tsv"),
         patterns: &read(&dist, "patterns.tsv"),
+        katakana: &read(&dist, "katakana.tsv"),
     })
     .unwrap();
     eprintln!("loaded in {:?}", t.elapsed());
@@ -91,6 +92,7 @@ fn matches_native_findings_on_yokohama() {
         func: &read(&dist, "func.bin"),
         rerank: &read(&dist, "rerank.tsv"),
         patterns: &read(&dist, "patterns.tsv"),
+        katakana: &read(&dist, "katakana.tsv"),
     })
     .unwrap();
     let text = std::fs::read_to_string("../fixtures/yokohama_shizei_jorei.txt").unwrap();
@@ -134,6 +136,7 @@ fn samples_are_corrected_as_expected_with_pure_rust_tokenizer() {
         func: &read(&dist, "func.bin"),
         rerank: &read(&dist, "rerank.tsv"),
         patterns: &read(&dist, "patterns.tsv"),
+        katakana: &read(&dist, "katakana.tsv"),
     })
     .unwrap();
     let samples: serde_json::Value =

@@ -12,6 +12,7 @@
 //! | func.bin | | 文法モデル (判定器の特徴量) |
 //! | patterns.tsv | | 実際の誤字から集めた書き換えパターン |
 //! | rerank.tsv | | 採否の判定器 |
+//! | katakana.tsv | | カタカナ語の出現数 (カタカナ語の打ち間違いの検出) |
 
 use std::path::Path;
 
@@ -44,6 +45,10 @@ pub fn load_dir(dir: &Path, tok: Tokenizer, cfg: Config) -> Result<Checker> {
     let path = dir.join("patterns.tsv");
     if path.exists() {
         checker = checker.with_patterns(crate::patterns::Patterns::load(&path)?);
+    }
+    let path = dir.join("katakana.tsv");
+    if path.exists() {
+        checker = checker.with_katakana(crate::katakana::Katakana::load(&path)?);
     }
     let path = dir.join("rerank.tsv");
     if path.exists() {

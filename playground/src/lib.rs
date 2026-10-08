@@ -10,6 +10,7 @@ use celso::checker::{
     load_readings_from_reader,
 };
 use celso::cooc::Cooc;
+use celso::katakana::Katakana;
 use celso::lm::{Model, UNK};
 use celso::norm::norm;
 use celso::patterns::Patterns;
@@ -39,6 +40,8 @@ pub struct Assets<'a> {
     pub rerank: &'a [u8],
     /// 実際の誤字から集めた書き換えパターン (TSV)。空なら使わない
     pub patterns: &'a [u8],
+    /// カタカナ語の出現数 (TSV)。空なら使わない
+    pub katakana: &'a [u8],
 }
 
 #[derive(Serialize)]
@@ -90,6 +93,9 @@ impl Engine {
         }
         if !a.patterns.is_empty() {
             checker = checker.with_patterns(Patterns::from_tsv(std::str::from_utf8(a.patterns)?)?);
+        }
+        if !a.katakana.is_empty() {
+            checker = checker.with_katakana(Katakana::from_tsv(std::str::from_utf8(a.katakana)?)?);
         }
         if !a.rerank.is_empty() {
             checker = checker.with_rerank(Reranker::from_tsv(std::str::from_utf8(a.rerank)?)?);
@@ -153,6 +159,7 @@ impl Playground {
         func: &[u8],
         rerank: &[u8],
         patterns: &[u8],
+        katakana: &[u8],
     ) -> Result<Playground, JsValue> {
         Engine::load(Assets {
             model,
@@ -166,6 +173,7 @@ impl Playground {
             func,
             rerank,
             patterns,
+            katakana,
         })
         .map(Playground)
         .map_err(|e| JsValue::from_str(&e.to_string()))
