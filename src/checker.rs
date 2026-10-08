@@ -301,7 +301,7 @@ pub struct Checker {
     /// 指摘は文の中身だけで決まる (文書内繰り返しの抑制は文書全体で毎回かけ直す) ので、
     /// 編集されていない文は再計算しなくてよい。
     cache: Option<std::sync::RwLock<FxHashMap<u64, Vec<Finding>>>>,
-    /// CELSO_TRACE が設定されていれば、閾値に届かなかった候補も含めて採点の内訳を stderr へ出す
+    /// `CELSO_TRACE` が設定されていれば、閾値に届かなかった候補も含めて採点の内訳を stderr へ出す
     /// (ケースの調査用。組み込み先では設定しない)
     trace: bool,
 }
@@ -619,7 +619,7 @@ impl Checker {
             }
         }
         for site in &mut sites {
-            site.sort_by(|x, y| y.delta.total_cmp(&x.delta));
+            dedup_site(sent, site);
             site.truncate(self.cfg.top_k);
         }
         sites
@@ -647,6 +647,7 @@ impl Checker {
     /// 修正候補を採点して、閾値 (判定器があればその床) を超えたものを返す。
     /// 判定器があるときは `delta` を判定器の対数オッズに置き換える。
     /// `dump` が真なら判定器を通さず、`floor` 以上の候補をすべて特徴量つきで返す。
+    #[allow(clippy::too_many_lines)] // 候補ごとの採点の流れ (足切り → n-gram → 文法モデル → 共起 → 判定器) を 1 か所で追えるようにしている
     fn scan(
         &self,
         toks: &[Token],
@@ -863,7 +864,9 @@ impl Checker {
         sig: &Signals,
     ) -> crate::rerank::Features {
         let mut f: crate::rerank::Features = Vec::with_capacity(20);
-        self.emit_features(toks, c, d, sig, &mut |k, v| f.push((k.to_string(), v)));
+        self.emit_features(toks, c, d, sig, &mut |k, v| {
+            f.push((k.to_string(), v));
+        });
         f
     }
 
@@ -883,6 +886,7 @@ impl Checker {
 
     /// 判定器の特徴量を 1 つずつ `emit(名前, 値)` に渡す。名前は「種類:内容」の形にして、
     /// 種類ごとに別の重みを持たせる。
+    #[allow(clippy::too_many_lines)] // 特徴量の一覧を 1 か所で見渡せるようにしている
     fn emit_features(
         &self,
         toks: &[Token],
@@ -905,7 +909,7 @@ impl Checker {
         let key = |t: Option<&Token>, buf: &mut String| match t {
             None => buf.push_str("<s>"),
             Some(t) if matches!(t.pos, "助詞" | "助動詞" | "記号") => {
-                buf.push_str(&t.surface)
+                buf.push_str(&t.surface);
             }
             Some(t) => {
                 let _ = write!(buf, "{}-{}", t.pos, t.pos1);
@@ -1804,6 +1808,23 @@ fn repeated_function_words(toks: &[Token]) -> Vec<Finding> {
         .collect()
 }
 
+/// 箇所の候補をスコアの高い順に並べ、直した文が同じになる候補は最も高いものだけを残す。
+/// 規則とパターンが同じ「を」の削除を出したり、「をを」のどちらの「を」を消すかで別の候補になったりして、
+/// 別案に同じものが並ぶため。
+fn dedup_site(sent: &str, site: &mut Vec<Finding>) {
+    site.sort_by(|x, y| y.delta.total_cmp(&x.delta));
+    let mut seen: Vec<String> = Vec::with_capacity(site.len());
+    site.retain(|f| {
+        let k = apply_finding(sent, f);
+        if seen.contains(&k) {
+            false
+        } else {
+            seen.push(k);
+            true
+        }
+    });
+}
+
 /// 判定器の `#tau_kind` に書く、名詞の間の「の」を消す候補の名前 (他の削除より厳しい閾値にする)。
 pub const DELETE_GENITIVE: &str = "delete-gen";
 
@@ -2221,6 +2242,33 @@ mod tests {
     }
 
     #[test]
+    fn same_edit_from_different_sources_is_listed_once() {
+        let f = |delta: f32, kind: EditKind| Finding {
+            start: 3,
+            end: 4,
+            original: "を".into(),
+            replacement: String::new(),
+            kind,
+            delta,
+            alternatives: Vec::new(),
+        };
+        let mut site = vec![
+            f(2.0, EditKind::Pattern),
+            f(3.8, EditKind::Pattern),
+            f(1.6, EditKind::Delete),
+        ];
+        // 1 つ目の「を」を消す候補も、直した文は同じ
+        site.push(Finding {
+            start: 2,
+            end: 3,
+            ..f(1.0, EditKind::Delete)
+        });
+        dedup_site("資料をを読む。", &mut site);
+        assert_eq!(site.len(), 1);
+        assert!((site[0].delta - 3.8).abs() < 1e-6);
+    }
+
+    #[test]
     fn apply_finding_replaces_by_char_offsets() {
         let f = |start, end, r: &str| Finding {
             start,
@@ -2246,7 +2294,7 @@ mod tests {
         let Ok(mut c) = tiny_checker() else { return };
         let t = toks("対象を比較する。");
         let reading = t[0].reading;
-        assert!(!reading.is_empty());
+        assert_ne!(reading, "");
         // 「対照」は「対象」より 10 倍少ない
         c.readings.insert(
             reading.to_string(),
@@ -2316,10 +2364,10 @@ mod tests {
         assert_eq!(fixes("甲の指示を従う。"), [(4, "に".to_string())]);
         assert_eq!(fixes("法令を違反した。"), [(2, "に".to_string())]);
         // 正しい文や、サ変名詞が「する」を伴わない形には出さない
-        assert!(fixes("資料に基づき説明した。").is_empty());
-        assert!(fixes("違反を是正する。").is_empty());
-        assert!(fixes("従事を命じる。").is_empty());
-        assert!(fixes("部下を従える。").is_empty());
+        assert_eq!(fixes("資料に基づき説明した。"), []);
+        assert_eq!(fixes("違反を是正する。"), []);
+        assert_eq!(fixes("従事を命じる。"), []);
+        assert_eq!(fixes("部下を従える。"), []);
     }
 
     #[test]

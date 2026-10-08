@@ -33,9 +33,18 @@ def okurigana(w: str, r: str) -> bool:
     return p > 0 and is_kanji(w[p - 1]) and is_hiragana(a) and is_hiragana(b)
 
 
+NOTICE = (
+    '# celso の誤字パターン。京都大学 日本語Wikipedia入力誤りデータセット (JWTD v2) の train から作成した。\n'
+    '# 元データ: https://nlp.ist.i.kyoto-u.ac.jp/?日本語Wikipedia入力誤りデータセット (CC BY-SA 3.0)\n'
+    '# このファイルも CC BY-SA 3.0 (https://creativecommons.org/licenses/by-sa/3.0/deed.ja) で提供する。\n'
+)
+
+
 def main(src: str, out: str) -> None:
     kept = 0
     with open(out, 'w', encoding='utf-8') as f:
+        # 配布するファイル自体に出典とライセンスを書く (タブを含まない行は読み込み時に読み飛ばされる)
+        f.write(NOTICE)
         for line in open(src, encoding='utf-8'):
             p = line.rstrip('\n').split('\t')
             w, r, sup, dw, dr = p[0], p[1], p[2], int(p[4]), int(p[5])

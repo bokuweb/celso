@@ -58,37 +58,39 @@ impl Reranker {
 
     /// TSV (名前 \t 重み) を読む。先頭の `#tau` / `#floor` / `#tau_kind` / `#exempt` 行は設定として読む。
     pub fn from_tsv(text: &str) -> Result<Self> {
-        let mut r = Self::new(FxHashMap::default());
+        let mut out = Self::new(FxHashMap::default());
         for line in text.lines() {
-            let mut it = line.split('\t');
-            let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            let mut cols = line.split('\t');
+            let (Some(name), Some(value)) = (cols.next(), cols.next()) else {
                 continue;
             };
-            match k {
+            match name {
                 "#tau" => {
-                    for (i, x) in v.split(',').enumerate().take(3) {
-                        r.tau[i] = x.trim().parse()?;
+                    for (i, x) in value.split(',').enumerate().take(3) {
+                        out.tau[i] = x.trim().parse()?;
                     }
                 }
-                "#floor" => r.floor = v.trim().parse()?,
+                "#floor" => out.floor = value.trim().parse()?,
                 // #tau_kind \t 種類 \t 法令文,一般文,契約書
                 "#tau_kind" => {
-                    let t = it.next().unwrap_or("");
-                    let mut a = r.tau;
-                    for (i, x) in t.split(',').enumerate().take(3) {
-                        a[i] = x.trim().parse()?;
+                    let taus = cols.next().unwrap_or("");
+                    let mut per_domain = out.tau;
+                    for (i, x) in taus.split(',').enumerate().take(3) {
+                        per_domain[i] = x.trim().parse()?;
                     }
-                    r.tau_kind.insert(v.trim().to_string(), a);
+                    out.tau_kind.insert(value.trim().to_string(), per_domain);
                 }
-                "#exempt" => r.exempt.extend(v.split(',').map(|x| x.trim().to_string())),
+                "#exempt" => out
+                    .exempt
+                    .extend(value.split(',').map(|x| x.trim().to_string())),
                 _ => {
-                    let w: f32 = v.trim().parse()?;
-                    r.hashed.insert(key(k), w);
-                    r.weights.insert(k.to_string(), w);
+                    let weight: f32 = value.trim().parse()?;
+                    out.hashed.insert(key(name), weight);
+                    out.weights.insert(name.to_string(), weight);
                 }
             }
         }
-        Ok(r)
+        Ok(out)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -171,6 +173,7 @@ type Row = (f32, f32, Vec<(usize, f32)>);
 /// L2 正則化つきロジスティック回帰を Adagrad で学習する。
 /// `min_count` 回未満しか出ない特徴量は捨てる (過学習を防ぎ、重みの表を小さくする)。
 #[must_use]
+#[allow(clippy::many_single_char_names)] // 学習の式 (w・x・y・p・g) の記号に合わせている
 pub fn train(
     data: &[Example],
     epochs: usize,

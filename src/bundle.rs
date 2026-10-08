@@ -1,4 +1,4 @@
-//! 配布物のディレクトリ (scripts/build_all.sh の data/dist/) から検査器を組み立てる。
+//! 配布物のディレクトリ (`scripts/build_all.sh` の `data/dist/`) から検査器を組み立てる。
 //!
 //! `celso check` の既定 (data/ 以下の個別ファイル) と同じ構成を、1 つのディレクトリから読む。
 //! 回帰テスト (tests/regression.rs) と組み込み先 (elsa-server) が同じ組み立て方を使うためのもの。
@@ -31,7 +31,7 @@ pub fn load_dir(dir: &Path, tok: Tokenizer, cfg: Config) -> Result<Checker> {
     let readings = if readings_path.exists() {
         load_readings(&readings_path, &keep)?
     } else {
-        Default::default()
+        rustc_hash::FxHashMap::default()
     };
     let mut checker = Checker::new(tok, lm, cfg, infl, readings);
     let path = dir.join("cooc.bin");

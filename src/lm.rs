@@ -197,9 +197,8 @@ pub fn load_any(path: &Path) -> Result<Box<dyn LanguageModel>> {
         return Ok(Box::new(crate::ngset::NgramSet::load(path)?));
         #[cfg(not(feature = "ngset"))]
         anyhow::bail!("存在フィルタ版のモデル (CELSONS1) は ngset feature が必要");
-    } else {
-        Ok(Box::new(Model::load(path)?))
     }
+    Ok(Box::new(Model::load(path)?))
 }
 
 /// 完成済みモデル。

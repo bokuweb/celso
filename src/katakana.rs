@@ -8,7 +8,7 @@
 //! 先頭・末尾の字を消す直し方と、5 字未満の語は対象にしない。表記の揺れ (小書きの仮名・ヴ・末尾の長音) も出さない。
 //! JWTD の開発用 (先頭 5000 件) で、正解 124 件に対して正しい文での指摘 26 件 (うち一部は本物の誤り)。
 //!
-//! 表は「語 \t 出現数」の TSV (scripts/katakana_lexicon.sh)。メモリを抑えるため、語の順に並べた 1 本の文字列と
+//! 表は「語 \t 出現数」の TSV (`scripts/katakana_lexicon.py`)。メモリを抑えるため、語の順に並べた 1 本の文字列と
 //! 行頭の位置だけを持ち、二分探索で引く (8 万語で約 2MB)。
 
 use anyhow::{Result, bail};
@@ -102,7 +102,7 @@ impl Katakana {
         Ok(Self { text, lines })
     }
 
-    /// 語の順に並んだ TSV (scripts/katakana_lexicon.py の出力) なら、読んだ文字列をそのまま使う
+    /// 語の順に並んだ TSV (`scripts/katakana_lexicon.py` の出力) なら、読んだ文字列をそのまま使う
     /// (並べ直し用の表と文字列の複製を作らないので、読み込み時のメモリが増えない)。並んでいなければ [`Self::from_tsv`]。
     pub fn from_sorted_string(src: String) -> Result<Self> {
         let mut lines = Vec::new();
@@ -337,7 +337,7 @@ mod tests {
         // 語末の脱字 (5 字以上)
         assert_eq!(
             fixes(&k, "キャラクーの設定"),
-            [("".to_string(), "タ".to_string())]
+            [(String::new(), "タ".to_string())]
         );
         // 入れ替え (「ベル」→「ルベ」は最小の範囲で示す)
         let f = k.find("州都はペンシベルニア州にある");
