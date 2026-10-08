@@ -601,6 +601,7 @@ impl Checker {
         }
         cands.extend(repeated_function_words(&toks));
         cands.extend(wrong_case_before_ni_verbs(&toks));
+        cands.extend(missing_ni_and_iu(&toks));
         // 箇所にまとめる: 1 文字以内で隣り合う候補は同じ誤りの別解とみなす
         // (「飲食は店」の「は」を消す案と「店」を消す案など)
         cands.sort_by_key(|f| (f.start, f.end));
@@ -1921,6 +1922,115 @@ fn wrong_case_before_ni_verbs(toks: &[Token]) -> Vec<Finding> {
     out
 }
 
+/// 「に」を伴って複合助詞になる動詞 (原形)。名詞の直後にあれば「に」が抜けている (「契約関して」→「契約に関して」)。
+const NI_COMPOUND_VERBS: &[&str] = &[
+    "関する",
+    "関す",
+    "際する",
+    "際す",
+    "基づく",
+    "伴う",
+    "応じる",
+    "対する",
+    "対す",
+];
+
+/// 「という」の後ろに来やすい名詞。「と」の後ろの名詞が述語 (「と規定する」) や次の節の主語 (「と取引者が誤認」)
+/// のことも多いので、「という」を補うのはこれらの名詞の前だけにする (判決文の要旨で誤検出が多かった)。
+const IU_NOUNS: &[&str] = &[
+    "内容",
+    "趣旨",
+    "意味",
+    "理由",
+    "話",
+    "意見",
+    "主張",
+    "考え",
+    "事実",
+    "指摘",
+    "見解",
+    "立場",
+    "方針",
+    "目的",
+    "条件",
+    "前提",
+    "結論",
+    "認識",
+    "感覚",
+    "ニュアンス",
+    "印象",
+    "噂",
+    "説",
+    "名目",
+    "意図",
+    "経緯",
+    "問題",
+    "疑い",
+    "評価",
+    "批判",
+    "声",
+    "報道",
+    "情報",
+    "連絡",
+    "通知",
+    "記載",
+    "表現",
+    "言葉",
+    "発言",
+    "趣き",
+];
+
+/// 抜けやすい「に」「いう」を補う (文法の事実なので n-gram や判定器を通さずに出す)。
+///
+/// - 名詞の直後の「対して」「関して」「ついて」「よって」などには「に」が要る (「北朝鮮対して」「この点ついて」)。
+///   「に」を補うと分かち書きが変わる (「に対し」「について」) ので、語単位の n-gram では差が出にくかった
+/// - 活用語の終止形 +「と」+ 名詞は「という」の「いう」が抜けている (「改めたいとニュアンス」「合意したと内容」)
+fn missing_ni_and_iu(toks: &[Token]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let insert = |at: usize, repl: &str| Finding {
+        start: at,
+        end: at,
+        original: String::new(),
+        replacement: repl.to_string(),
+        kind: EditKind::Pattern,
+        delta: REPEATED_WORD_SCORE,
+        alternatives: Vec::new(),
+    };
+    for i in 1..toks.len() {
+        let (prev, t) = (&toks[i - 1], &toks[i]);
+        let next = toks.get(i + 1);
+        // 「すべて応じる」「一切応じない」のように副詞として使う名詞の後ろには「に」が要らない
+        if prev.pos == "名詞" && prev.pos1 != "副詞可能" && prev.end == t.start {
+            let te_follows = next.is_some_and(|x| x.surface == "て");
+            let compound = (t.surface == "対"
+                && t.pos1 == "接続詞的"
+                && next.is_some_and(|x| x.pos == "動詞" && x.base == "する"))
+                || (t.pos == "動詞" && NI_COMPOUND_VERBS.contains(&t.base))
+                || (t.pos == "動詞" && t.base == "つく" && t.surface == "つい" && te_follows)
+                || (t.pos == "動詞" && t.base == "よる" && t.surface == "よっ" && te_follows);
+            if compound {
+                out.push(insert(t.start, "に"));
+            }
+        }
+        if t.surface == "と"
+            && t.pos == "助詞"
+            && t.pos1 == "格助詞"
+            && matches!(prev.pos, "動詞" | "助動詞" | "形容詞")
+            && prev.conj_form == "基本形"
+            && let Some(n) = next
+            && n.pos == "名詞"
+            && IU_NOUNS.contains(&n.surface.as_str())
+            // 「と主張して」「と発言した」のように動詞として使うときは出さない
+            && !toks
+                .get(i + 2)
+                .is_some_and(|x| x.pos == "動詞" && matches!(x.base, "する" | "できる" | "出来る"))
+        {
+            out.push(insert(n.start, "いう"));
+        }
+    }
+    out
+}
+
 /// 助詞・接頭辞の重複の指摘のスコア (パターンのスコア = log10(支持数) に合わせ、支持数 100 相当)。
 const REPEATED_WORD_SCORE: f32 = 2.0;
 
@@ -2440,6 +2550,53 @@ mod tests {
         assert!(drop_old_style_small_kana(vec![f(3), f(10)]).is_empty());
         // 1 か所だけなら打ち間違いの可能性があるので残す
         assert_eq!(drop_old_style_small_kana(vec![f(3)]).len(), 1);
+    }
+
+    #[test]
+    fn missing_ni_before_compound_particles_is_inserted() {
+        let fixes = |s: &str| -> Vec<(usize, String)> {
+            missing_ni_and_iu(&toks(s))
+                .into_iter()
+                .map(|f| (f.start, f.replacement))
+                .collect()
+        };
+        assert_eq!(fixes("北朝鮮対して融和的だ。"), [(3, "に".to_string())]);
+        assert_eq!(fixes("契約関して定める。"), [(2, "に".to_string())]);
+        assert_eq!(fixes("この点ついて説明する。"), [(3, "に".to_string())]);
+        // 「に」がある文や、「つく」の別の意味には出さない
+        assert_eq!(fixes("北朝鮮に対して融和的だ。"), []);
+        assert_eq!(fixes("この点について説明する。"), []);
+        assert_eq!(fixes("傷がついている。"), []);
+        // 副詞のように使う名詞 (「すべて」「一切」) の後ろは「に」が要らない
+        assert_eq!(fixes("要求にすべて応じることはできない。"), []);
+        assert_eq!(fixes("和解にも一切応じなかった。"), []);
+    }
+
+    #[test]
+    fn missing_iu_after_quotative_to_is_inserted() {
+        let fixes = |s: &str| -> Vec<(usize, String)> {
+            missing_ni_and_iu(&toks(s))
+                .into_iter()
+                .map(|f| (f.start, f.replacement))
+                .collect()
+        };
+        // 「改めたいとニュアンス」「合意したと内容」は「という」の「いう」が抜けている
+        assert_eq!(
+            fixes("改めたいとニュアンスがある。"),
+            [(5, "いう".to_string())]
+        );
+        assert_eq!(
+            fixes("合意したと内容を確認した。"),
+            [(5, "いう".to_string())]
+        );
+        // 正しい言い方には出さない
+        assert_eq!(fixes("合意したという内容を確認した。"), []);
+        assert_eq!(fixes("到着すると同時に連絡した。"), []);
+        assert_eq!(fixes("彼と内容を確認した。"), []);
+        // 「と」の後ろの名詞が述語 (「と規定する」「と信頼する」) や次の節の主語 (「と取引者が誤認」) のときは出さない
+        assert_eq!(fixes("手当金を支給すると規定するにとどまる。"), []);
+        assert_eq!(fixes("真実であると取引者が誤認する。"), []);
+        assert_eq!(fixes("義務を負うと主張して提訴した。"), []);
     }
 
     #[test]
