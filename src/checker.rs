@@ -2084,11 +2084,11 @@ pub const INFLECTION_AUX: &str = "inflection-aux";
 /// 支持数の多いパターン (「をを」「れいる」) は文脈が多少不自然でも採り、支持数の少ないものは改善幅で確かめる。
 const PATTERN_SUPPORT_WEIGHT: f32 = 4.0;
 /// パターンの指摘を残すスコアの下限 [法令文, 一般文, 契約書]。
-/// 一般文は、削除・カタカナ語の誤検出を減らした分を回して JWTD の開発用 (先頭 5000 件)・判例要旨 dev・wiki2 で決めた値
-/// (3.5 → 3.0 で、検出 +0.4pt に対して正しい文での誤検出 +0.2pt)。
+/// 一般文は JWTD の開発用 (先頭 5000 件)・判例要旨 dev・wiki2 で決めた値。3.0 に下げると検出と誤検出が
+/// ほぼ 1 対 1 で増えるだけだった (パターンを開発用を含む train から作っていたときは 3.0 が良く見えたが、それは漏れのため)。
 /// 法令文・契約書は、支持数の少ないパターンが例規・契約書の言い回しに当たりやすいので厳しめにする
 /// (一宮市・JEITA 大の原文での誤検出を増やさない値)。
-const PATTERN_MIN_SCORE: [f32; 3] = [5.0, 3.0, 5.0];
+const PATTERN_MIN_SCORE: [f32; 3] = [5.0, 3.5, 5.0];
 
 /// パターンの指摘を採るか (`log_support` は log10(支持数))。
 fn pattern_accepted(d: Domain, sentence_delta: f32, log_support: f32) -> bool {
@@ -2701,10 +2701,10 @@ mod tests {
         // 支持数 2 件 (log10 ≒ 0.3) は、文の尤度が十分に上がるときだけ採る
         assert!(!pattern_accepted(g, 1.0, 0.3));
         assert!(pattern_accepted(g, 3.0, 0.3));
-        // 一般文の下限は 3.0 (改善幅 1.9 + 4 × 0.3 = 3.1 は採り、法令文では捨てる)
-        assert!(pattern_accepted(g, 1.9, 0.3));
-        assert!(!pattern_accepted(g, 1.7, 0.3));
-        assert!(!pattern_accepted(Domain::Legal, 1.9, 0.3));
+        // 一般文の下限は 3.5 (改善幅 2.4 + 4 × 0.3 = 3.6 は採り、法令文では捨てる)
+        assert!(pattern_accepted(g, 2.4, 0.3));
+        assert!(!pattern_accepted(g, 2.2, 0.3));
+        assert!(!pattern_accepted(Domain::Legal, 2.4, 0.3));
         // 「いたしまします → いたしまいます」(文の Δ が大きく負) はどの文書でも捨てる
         assert!(!pattern_accepted(g, -12.0, 0.78));
         assert!(!pattern_accepted(Domain::Legal, -12.0, 0.78));

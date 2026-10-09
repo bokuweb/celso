@@ -103,7 +103,9 @@ $BIN build-lm --order 5 --vocab data/vocab_func.txt --min-word-count 1 --min-cou
 
 # 10. 誤字パターン (JWTD train の実際の誤字から。CC BY-SA 3.0)
 #     候補の抽出 → 全コーパスでの出現数 → 1 段目の選別 → 分野のコーパスでの出現数 → 2 段目 (分野・送り仮名)
-python3 scripts/patterns/extract.py data/jwtd/train.jsonl data/patterns_cand.tsv
+#     調整に使う JWTD 先頭 5000 件 (開発用) を含めると開発用の誤りがそのままパターンになり、開発用の検出が 1.5pt 甘く出る。
+#     開発用を除いた train_rest から作る (test の結果は変わらない)
+python3 scripts/patterns/extract.py data/jwtd/train_rest.jsonl data/patterns_cand.tsv
 $BIN count-patterns data/patterns_cand.tsv -o data/patterns_counted.tsv \
   data/corpus/egov.txt data/corpus/reiki.f.txt data/corpus/wiki12.f.txt data/corpus/contracts2.txt
 python3 scripts/patterns/select.py data/patterns_counted.tsv data/patterns_sel.tsv
