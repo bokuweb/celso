@@ -85,11 +85,13 @@ fi
 cat data/corpus/egov.txt data/corpus/wiki1.f.txt data/corpus/reiki.f.txt \
   | $BIN tokenize --inflections data/inflections.tsv --readings data/readings.tsv > /dev/null
 
-# 7. 語彙 1 万語 + 品詞クラス、3-gram、強い足切りで配布用モデル (約 13MB) を作る
+# 7. 語彙 1 万語 + 品詞クラス、3-gram で配布用モデル (判例要旨入りで約 33MB) を作る。
+#    足切り 1,3,5 は、1,5,10 (約 19MB) より JWTD test の誤検出 -7%・判例要旨 -9%・市税条例 -41%・JEITA -16% で検出も上がった。
+#    1,4,7 (約 24MB) は効果が半分以下、1,2,3 (約 54MB) は判例要旨・例規の誤検出が増え回帰テストを 1 件落とした
 $BIN vocab --size 10000 -o data/vocab10k.txt "${INPUTS[@]}"
 #    誤変換の候補にする同音異字の語を足す (約 5 千語、+0.7MB)
 python3 scripts/homophone_vocab.py data/vocab10k.txt data/readings.tsv data/homo_words.txt > data/vocab.txt
-$BIN build-lm --order 3 --min-count 1,5,10 --vocab data/vocab.txt -o data/model.bin "${LM_INPUTS[@]}"
+$BIN build-lm --order 3 --min-count 1,3,5 --vocab data/vocab.txt -o data/model.bin "${LM_INPUTS[@]}"
 # 8. 同音異字の判定に使う文内共起モデル (約 3.7MB)。手がかりの語は頻出 5 万語から選ぶ。
 #    集計 (data/cooc_stats.bin) を残しておくと、--top-k などを変えて作り直すときにコーパスを数え直さない
 $BIN vocab --size 50000 -o data/vocab50k.txt "${INPUTS[@]}"
