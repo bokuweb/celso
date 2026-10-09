@@ -4,7 +4,8 @@
 - 正例: JWTD の誤りのある文 (tr_pre*) で、直した文が正しい文 (tr_post*) と一致した候補
 - 負例: JWTD の正しい文 (tr_post*) と、判例要旨の正しい文 (han_tr) で出た候補 (判例要旨は重みを足す)
 
-使い方: python3 scripts/charrank/train.py 文のディレクトリ 候補のディレクトリ prior.tsv 判例の重み 閾値 出力
+使い方: python3 scripts/charrank/train.py 文のディレクトリ 候補のディレクトリ prior.tsv 判例の重み 閾値 出力 [一般文の種類ごとの閾値]
+種類ごとの閾値は「del=-0.5,ins=0.5,…」の形で、#tau_kind 行 (法令文・契約書の列は 閾値 のまま) として書く。
 (scikit-learn が必要)
 """
 import os
@@ -18,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from feat import feats, load_prior, nf, parse  # noqa: E402
 
 
-def main(text_dir, cand_dir, prior_path, han_weight, tau, out_path):
+def main(text_dir, cand_dir, prior_path, han_weight, tau, out_path, kinds=''):
     load_prior(prior_path)
     X, y, w = [], [], []
     for k in range(64):
@@ -43,6 +44,9 @@ def main(text_dir, cand_dir, prior_path, han_weight, tau, out_path):
         f.write('# 文字単位の直しの採否の判定器 (celso scripts/charrank)。#prior 行は京大 JWTD v2 (CC BY-SA 3.0) の\n')
         f.write('# 学習用の差分から数えた「誤り → 正しい」の出現数で、JWTD の二次的著作物として CC BY-SA 3.0 で提供する。\n')
         f.write(f'#tau\t{tau},{tau},{tau}\n')
+        for kv in filter(None, kinds.split(',')):
+            k, v = kv.split('=')
+            f.write(f'#tau_kind\t{k}\t{tau},{v},{tau}\n')
         for k in sorted(W):
             if abs(W[k]) > 1e-6:
                 f.write(f'{k}\t{W[k]:.6g}\n')

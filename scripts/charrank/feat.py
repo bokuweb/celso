@@ -12,8 +12,11 @@ def cls(c):
     c=c[0]
     return 'k' if isk(c) else 'h' if ishira(c) else 'K' if iskata(c) else 'o'
 PRIOR={}
-for l in open(S+'/prior_ex.tsv'):
-    a,b,v=l.rstrip('\n').split('\t'); PRIOR[(a,b)]=int(v)
+def load_prior(path):
+    """「誤り \t 正しい \t 出現数」の表 (make_data.py の prior.tsv) を読む。"""
+    PRIOR.clear()
+    for l in open(path, encoding='utf-8'):
+        a,b,v=l.rstrip('\n').split('\t'); PRIOR[(a,b)]=int(v)
 RX=re.compile(r'「(.*?)」→「(.*?)」 文字=(\S+) 単語=(\S+) 位置=(\d+) logp=(\S+) 差=(\S+) 怪しい=(\d+) 未知語=(-?\d+) 語数=(-?\d+) 文法=(\S+) 共起=(\S+)\t(.*)')
 def parse(fn):
     out=[]

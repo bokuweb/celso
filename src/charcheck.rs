@@ -165,6 +165,13 @@ impl CharRanker {
         self.rank.tau(d)
     }
 
+    /// 直し方の種類 (del / ins / subk / subn / swap) ごとの採用の閾値。`#tau_kind` に行が無ければ `#tau` の値。
+    /// 種類によって正しい文での誤検出の出やすさが違う (補いは判例要旨で、漢字の置き換えは Wikipedia で多い) ので分けて決める。
+    #[must_use]
+    pub fn tau_for(&self, original: &str, replacement: &str, d: Domain) -> f32 {
+        self.rank.tau_for(edit_type(original, replacement), d)
+    }
+
     /// 誤りである対数オッズ。`fixed` は直した文 (文字単位)。
     #[must_use]
     pub fn score(&self, c: &CharCandidate, fixed: &[char], w: &WordSignals) -> f32 {
@@ -500,6 +507,20 @@ mod tests {
         )
         .unwrap();
         CharChecker::new(Box::new(lm), CharChecker::parse_homo(homo))
+    }
+
+    #[test]
+    fn thresholds_can_differ_by_edit_type() {
+        let r = CharRanker::from_tsv(
+            "#tau\t0.75,0.75,0.75\n#tau_kind\tdel\t0.75,-0.5,0.75\n#tau_kind\tsubk\t0.75,0.1,0.75\nbias\t0\n",
+        )
+        .unwrap();
+        // 削除 (「抜」→「」) と漢字の置き換え (「式」→「識」) は種類ごとの閾値
+        assert!((r.tau_for("抜", "", Domain::General) + 0.5).abs() < 1e-6);
+        assert!((r.tau_for("式", "識", Domain::General) - 0.1).abs() < 1e-6);
+        // 種類ごとの行が無いもの (かなの補い) と、他の文書の種類は #tau のまま
+        assert!((r.tau_for("", "い", Domain::General) - 0.75).abs() < 1e-6);
+        assert!((r.tau_for("抜", "", Domain::Legal) - 0.75).abs() < 1e-6);
     }
 
     #[test]

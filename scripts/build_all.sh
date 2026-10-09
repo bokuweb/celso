@@ -148,17 +148,21 @@ $BIN train-rerank "${RERANK_INPUTS[@]}" --floor=0 -o data/rerank.tsv
 # 法令文 -1.5、一般文 0.0、契約書 0.5 (一般文は、誤字パターン・カタカナ語の検出を足したぶん厳しくして
 # 正しい文での誤検出を以前と同じ水準に保つ)
 # 活用の誤り (「多くあろう → ある」) は JWTD の言い換え (〜であろう) に引きずられて判定器が強く負に振れるので、
-# 判定器を使わず種類ごとの閾値で決める。一般文の余計な助詞 (「西口側までは → は」) は判定器のスコアが
-# -1.2 前後に出るので、一般文の削除だけ閾値を -1.35 まで下げる。ただし名詞の間の「の」を消す候補
-# (「無料のシャトルバス」) は誤検出が多いので -0.5 にする (delete-gen)。どれも tests/regression で固定
+# 判定器を使わず種類ごとの閾値で決める。一般文の削除は、正しい文の助詞を消す誤検出 (「被害[が]軽減」
+# 「状態[を]関数」) が多いので 0.15 と厳しくし、判定器のスコアが低く出やすい実際の誤りだけ別の閾値に残す:
+# 名詞と 1 字の名詞の間の助詞 (「和菓子[は]店」、-1.3 前後に出る) は -1.35 (delete-nsfx)、係助詞の直前の助詞
+# (「西口側[まで]は」、-0.8 前後) は -0.95 (delete-pp)、名詞の間の「の」(「無料のシャトルバス」) は -0.5 (delete-gen)。
+# 一般文の基本の閾値 (取り違え・補い・活用) は 0.5。どれも tests/regression で固定し、JWTD 先頭 5000 件・
+# 判例要旨 dev・wiki2 test の正しい文での誤検出がいずれも下がる範囲で、検出が最も伸びる値にした
 # 判例要旨を使うときは、一般文の同音異字を -0.6 に下げる (判決文に寄ったぶん Wikipedia の漢字誤変換の検出が
 # 38 → 34% に落ちたのを戻す。調整は JWTD 先頭 5000 件・判例要旨の dev で行った)
 HANREI=${CELSO_HANREI_TEXT:+1} python3 - <<'PY'
 p = 'data/rerank.tsv'
 lines = [l for l in open(p).read().split('\n') if not l.startswith(('#exempt', '#tau_kind'))]
-lines = ['#tau\t-1.5,0.0,0.5' if l.startswith('#tau\t') else l for l in lines]
+lines = ['#tau\t-1.5,0.5,0.5' if l.startswith('#tau\t') else l for l in lines]
 i = next(k for k, l in enumerate(lines) if l.startswith('#floor'))
-extra = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,-1.35,0.5',
+extra = ['#exempt\tinflection-aux', '#tau_kind\tdelete\t-1.5,0.15,0.5',
+         '#tau_kind\tdelete-nsfx\t-1.5,-1.35,0.5', '#tau_kind\tdelete-pp\t-1.5,-0.95,0.5',
          '#tau_kind\tdelete-gen\t-1.5,-0.5,0.5']
 import os
 if os.environ.get('HANREI'):
@@ -191,8 +195,10 @@ python3 scripts/charlm/kanji_homo.py data/ipadic-utf8/lex.csv data/jwtd/train_re
 cp data/charlm.bin data/kanji_homo.tsv data/dist/
 
 # 14. 文字単位の直しの判定器 (scripts/charrank/)。JWTD train_rest から 9.6 万組を抜き出し、候補を書き出して学習する。
-#     負例には判例要旨の正しい文 (学習用から 6000 件、重み 2) も使う。閾値 1.0 は JWTD 先頭 5000 件・判例要旨 dev・
-#     wiki2 test で決めた (単語モデルが見落とした箇所だけで、正しい文での誤検出を 1 文あたり +0.6pt 程度に抑える値)
+#     負例には判例要旨の正しい文 (学習用から 6000 件、重み 2) も使う。閾値は直し方の種類ごと (一般文: 削除 -0.5・
+#     補い 0.5・漢字の置き換え 0.1・かなの置き換え 0・入れ替え 0) で、JWTD 先頭 5000 件・判例要旨 dev・wiki2 test と
+#     tests/regression で、単語モデルの閾値と合わせて決めた (補いは判例要旨で、漢字の置き換えは「呑み屋」のような
+#     正しい表記で誤検出しやすい)
 mkdir -p data/charrank
 python3 scripts/charrank/make_data.py data/jwtd/train_rest.jsonl data/charrank
 #    候補を出すときも配布時と同じひらがなに絞るため、出現数だけの判定器 (重みなし) を使う
@@ -205,5 +211,6 @@ fi
 for n in $TRAIN_SETS; do
   scripts/charrank/dump.sh data/dist data/charrank/prior_only.tsv data/charrank/$n.txt data/charrank/$n.c
 done
-uv run --with scikit-learn python scripts/charrank/train.py data/charrank data/charrank data/charrank/prior.tsv 2 1.0 data/charrank.tsv
+uv run --with scikit-learn python scripts/charrank/train.py data/charrank data/charrank data/charrank/prior.tsv 2 0.75 data/charrank.tsv \
+  del=-0.5,ins=0.5,subk=0.1,subn=0,swap=0
 cp data/charrank.tsv data/dist/

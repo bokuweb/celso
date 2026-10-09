@@ -17,6 +17,10 @@ use crate::checker::{EditKind, Finding};
 
 /// 対象にするカタカナ語の最短の長さ (文字数)。
 const MIN_LEN: usize = 5;
+/// この長さ未満の語は、字を補う直し (「キャラクー → キャラクター」) のときだけ指摘する。
+/// 5 字の語を同じ長さ・短い語に直す候補は固有名詞 (「プチペイド → プリペイド」「バイロック → バロック」) の誤検出が多い
+/// (Wikipedia の正しい文で 1 万字あたり約 1 件)。
+const MIN_LEN_NON_INSERT: usize = 6;
 /// この回数以上出てくる語は正しい語とみなす。
 const KNOWN_COUNT: u32 = 3;
 /// 直し先の語の最少の出現数。
@@ -260,6 +264,9 @@ impl Katakana {
             let Some(fix) = self.best_neighbor(w, own) else {
                 continue;
             };
+            if w.len() < MIN_LEN_NON_INSERT && fix.chars().count() <= w.len() {
+                continue;
+            }
             // 直す範囲は共通の前後を除いた最小の範囲にする
             let f: Vec<char> = fix.chars().collect();
             let mut pre = 0;
@@ -346,6 +353,20 @@ mod tests {
             (f[0].start, f[0].end, f[0].replacement.as_str()),
             (6, 8, "ルベ")
         );
+    }
+
+    #[test]
+    fn five_letter_words_are_fixed_only_by_inserting_a_letter() {
+        let k =
+            Katakana::from_tsv("キャラクター\t7571\nプリペイド\t3000\nバロック\t2000\n").unwrap();
+        // 5 字の語の脱字は直す
+        assert_eq!(
+            fixes(&k, "キャラクーの設定"),
+            [(String::new(), "タ".to_string())]
+        );
+        // 5 字の語を同じ長さ・短い語に直すのは、固有名詞 (「プチペイド」「バイロック」) の誤検出が多いので出さない
+        assert!(k.find("プチペイドが存在した").is_empty());
+        assert!(k.find("バイロックは降参した").is_empty());
     }
 
     #[test]

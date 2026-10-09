@@ -532,7 +532,9 @@ impl Checker {
             self.mlm_rescore_all(mlm, &texts, &doms, &mut works);
         }
         for (&i, sites) in todo.iter().zip(works) {
-            done[i] = Some(self.finalize(sites, sents[i].3));
+            let mut fs = self.finalize(sites, sents[i].3);
+            restore_dropped_i(&sents[i].2, &mut fs);
+            done[i] = Some(fs);
         }
         if let Some(c) = &self.cache {
             let mut c = c.write().unwrap();
@@ -649,7 +651,9 @@ impl Checker {
                 for cc in found {
                     let f = &cc.finding;
                     let end = f.end.max(f.start + 1);
-                    if taken.iter().any(|&(a, b)| f.start <= b + 1 && a <= end + 1) {
+                    if taken.iter().any(|&(a, b)| f.start <= b + 1 && a <= end + 1)
+                        || char_deletion_left_to_word_model(&toks, f)
+                    {
                         continue;
                     }
                     let fixed = apply_finding(sent, f);
@@ -705,10 +709,11 @@ impl Checker {
                                 cooc_delta: co,
                             };
                             let score = rk.score(&cc, &fixed_chars, &w);
+                            let tau = rk.tau_for(&f.original, &f.replacement, d);
                             if self.trace {
-                                eprintln!("    判定={score:.2} (閾値 {:.2})", rk.tau(d));
+                                eprintln!("    判定={score:.2} (閾値 {tau:.2})");
                             }
-                            score > rk.tau(d)
+                            score > tau
                         }
                         None => char_accepted(&f.original, &f.replacement, cd, sd),
                     };
@@ -910,13 +915,14 @@ impl Checker {
             }
             if let Some(r) = rerank_here {
                 delta = self.rerank_score(r, toks, &c, d, &signals());
-                // 名詞の間の「の」を消す候補は、他の削除と別の閾値 (`#tau_kind delete-gen`) で決める。
+                // 名詞の間の「の」などを消す候補は、他の削除と別の閾値 (`#tau_kind delete-gen` など) で決める。
                 // 最後の採否は種類 (delete) の閾値で行うので、閾値の差だけ Δ をずらす
                 if c.kind == EditKind::Delete
                     && c.b == c.a + 1
-                    && is_genitive_between_nouns(toks, c.a)
+                    && let Some(class) = delete_class(toks, c.a)
+                    && r.tau_kind.contains_key(class)
                 {
-                    delta += r.tau_for(c.kind.label(), d) - r.tau_for(DELETE_GENITIVE, d);
+                    delta += r.tau_for(c.kind.label(), d) - r.tau_for(class, d);
                 }
                 if self.trace {
                     self.trace_cand(
@@ -2010,6 +2016,67 @@ fn char_accepted(original: &str, replacement: &str, char_delta: f32, word_delta:
 /// 判定器の `#tau_kind` に書く、名詞の間の「の」を消す候補の名前 (他の削除より厳しい閾値にする)。
 pub const DELETE_GENITIVE: &str = "delete-gen";
 
+/// 判定器の `#tau_kind` に書く、名詞と 1 字の名詞の間の助詞を消す候補 (「和菓子[は]店」「土産物[から]店」) の名前。
+/// 複合語の中に紛れ込んだ助詞は判定器の点数が低く出やすいので、他の削除より緩い閾値にする。
+pub const DELETE_BEFORE_SHORT_NOUN: &str = "delete-nsfx";
+
+/// 判定器の `#tau_kind` に書く、係助詞の直前の助詞を消す候補 (「西口側[まで]は」) の名前。
+pub const DELETE_BEFORE_KAKARI: &str = "delete-pp";
+
+/// 「されてる」「読んでる」の「て」「で」を消す指摘 (→ される・読む) を、抜けた「い」を補う指摘 (→ されている) に替える。
+///
+/// どちらの直し方でも文は成り立つが、実際の誤字 (JWTD) では「い」の抜けの方が多く (開発用で 14 件対 6 件)、
+/// 書き言葉としても「ている」が自然。
+fn restore_dropped_i(sent: &str, findings: &mut [Finding]) {
+    let chars: Vec<char> = sent.chars().collect();
+    for f in findings {
+        if f.replacement.is_empty()
+            && matches!(f.original.as_str(), "て" | "で")
+            && chars.get(f.end) == Some(&'る')
+        {
+            f.start = f.end;
+            f.original.clear();
+            f.replacement.push('い');
+        }
+    }
+}
+
+/// 文字モデルの削除のうち、単語モデルが同じ削除を判断済みなので文字モデルでは拾わないもの。
+///
+/// 敬語の接頭辞 (「[ご]確認」) と名詞の間の「の」(「費用[の]面」) は、消しても文が成り立つので文字モデルの点数が
+/// 高く出やすいが、誤りであることは少ない。単語モデルはこれらを厳しい閾値 (delete-gen) や判定器で見ているので、
+/// 文字モデルで拾い直さない (JWTD の検出はそのままで、正しい文での誤検出が減った)。
+fn char_deletion_left_to_word_model(toks: &[Token], f: &Finding) -> bool {
+    if !f.replacement.is_empty() {
+        return false;
+    }
+    toks.iter()
+        .position(|t| t.start == f.start && t.end == f.end)
+        .is_some_and(|i| toks[i].pos == "接頭詞" || is_genitive_between_nouns(toks, i))
+}
+
+/// 1 語を消す候補のうち、delete と別の閾値で決めるものの分類 (`#tau_kind` の名前)。
+///
+/// 一般文では、正しい文の助詞を消す誤検出 (「被害[が]軽減」「状態[を]関数」) を抑えるために delete の閾値を厳しくする一方、
+/// 判定器の点数が低く出やすい実際の誤り (「和菓子[は]店」「西口側[まで]は」) はこの分類で緩い閾値に残す。
+fn delete_class(toks: &[Token], i: usize) -> Option<&'static str> {
+    if is_genitive_between_nouns(toks, i) {
+        return Some(DELETE_GENITIVE);
+    }
+    if toks[i].pos != "助詞" {
+        return None;
+    }
+    let next = toks.get(i + 1)?;
+    if i > 0 && toks[i - 1].pos == "名詞" && next.pos == "名詞" && next.surface.chars().count() == 1
+    {
+        Some(DELETE_BEFORE_SHORT_NOUN)
+    } else if next.pos1 == "係助詞" {
+        Some(DELETE_BEFORE_KAKARI)
+    } else {
+        None
+    }
+}
+
 /// 判定器の `#exempt` に書く、「活用語 + 推量の助動詞」をまとめて直す活用の候補の名前。
 pub const INFLECTION_AUX: &str = "inflection-aux";
 
@@ -2017,10 +2084,11 @@ pub const INFLECTION_AUX: &str = "inflection-aux";
 /// 支持数の多いパターン (「をを」「れいる」) は文脈が多少不自然でも採り、支持数の少ないものは改善幅で確かめる。
 const PATTERN_SUPPORT_WEIGHT: f32 = 4.0;
 /// パターンの指摘を残すスコアの下限 [法令文, 一般文, 契約書]。
-/// 一般文は JWTD の開発用 (先頭 5000 件) で、正しい文での誤検出を増やさずに検出が最も伸びる値。
+/// 一般文は、削除・カタカナ語の誤検出を減らした分を回して JWTD の開発用 (先頭 5000 件)・判例要旨 dev・wiki2 で決めた値
+/// (3.5 → 3.0 で、検出 +0.4pt に対して正しい文での誤検出 +0.2pt)。
 /// 法令文・契約書は、支持数の少ないパターンが例規・契約書の言い回しに当たりやすいので厳しめにする
 /// (一宮市・JEITA 大の原文での誤検出を増やさない値)。
-const PATTERN_MIN_SCORE: [f32; 3] = [5.0, 3.5, 5.0];
+const PATTERN_MIN_SCORE: [f32; 3] = [5.0, 3.0, 5.0];
 
 /// パターンの指摘を採るか (`log_support` は log10(支持数))。
 fn pattern_accepted(d: Domain, sentence_delta: f32, log_support: f32) -> bool {
@@ -2526,6 +2594,80 @@ mod tests {
     }
 
     #[test]
+    fn deletions_are_classified_for_their_own_thresholds() {
+        let t = toks("駅から無料のシャトルバスが出る。");
+        assert_eq!(
+            delete_class(&t, index_of(&t, "の", 0)),
+            Some(DELETE_GENITIVE)
+        );
+        // 名詞と 1 字の名詞の間の余計な助詞 (「和菓子は店」) は、他の削除より緩い閾値で拾う
+        let t = toks("和菓子は店や酒蔵が多い。");
+        assert_eq!(
+            delete_class(&t, index_of(&t, "は", 0)),
+            Some(DELETE_BEFORE_SHORT_NOUN)
+        );
+        // 係助詞の直前の余計な助詞 (「西口側までは」)
+        let t = toks("西口側までは宿泊施設が多い。");
+        assert_eq!(
+            delete_class(&t, index_of(&t, "まで", 0)),
+            Some(DELETE_BEFORE_KAKARI)
+        );
+        // それ以外の削除 (「被害が軽減」) は delete の閾値のまま
+        let t = toks("被害が軽減できる。");
+        assert_eq!(delete_class(&t, index_of(&t, "が", 0)), None);
+    }
+
+    #[test]
+    fn char_model_leaves_prefix_and_genitive_deletions_to_word_model() {
+        let del = |s: &str, start: usize, end: usize, original: &str| {
+            let f = Finding {
+                start,
+                end,
+                original: original.to_string(),
+                replacement: String::new(),
+                kind: EditKind::Pattern,
+                delta: 0.0,
+                alternatives: Vec::new(),
+            };
+            char_deletion_left_to_word_model(&toks(s), &f)
+        };
+        // 敬語の接頭辞 (「ご確認」の「ご」) と名詞の間の「の」(「費用の面」) は、単語モデルの判断に任せる
+        assert!(del("内容をご確認のうえ、ご返信ください。", 3, 4, "ご"));
+        assert!(del("いずれの案も、費用の面で課題がある。", 9, 10, "の"));
+        // 語の中の余分な字 (「離脱抜した」の「抜」) は文字モデルで拾う
+        assert!(!del("親子でも離脱抜した場合は", 6, 7, "抜"));
+    }
+
+    #[test]
+    fn dropped_i_after_te_is_restored_instead_of_deleting_te() {
+        let del = |start: usize, original: &str| Finding {
+            start,
+            end: start + 1,
+            original: original.to_string(),
+            replacement: String::new(),
+            kind: EditKind::Pattern,
+            delta: 0.0,
+            alternatives: Vec::new(),
+        };
+        // 「挙行されてる」の「て」を消す (される) より、抜けた「い」を補う (されている) 方を示す
+        let mut fs = vec![del(10, "て")];
+        restore_dropped_i("日本武道館で挙行されてる。", &mut fs);
+        assert_eq!((fs[0].start, fs[0].end), (11, 11));
+        assert_eq!(
+            (fs[0].original.as_str(), fs[0].replacement.as_str()),
+            ("", "い")
+        );
+        // 「読んでる」の「で」も同じ
+        let mut fs = vec![del(4, "で")];
+        restore_dropped_i("本を読んでる。", &mut fs);
+        assert_eq!(fs[0].replacement, "い");
+        // 後ろが「る」でなければそのまま (「されて、」)
+        let mut fs = vec![del(4, "て")];
+        restore_dropped_i("挙行されて、", &mut fs);
+        assert_eq!(fs[0].original, "て");
+    }
+
+    #[test]
     fn repeated_particle_or_prefix_is_removed() {
         let f = repeated_function_words(&toks("土産物はは店が並ぶ。"));
         assert_eq!(f.len(), 1);
@@ -2559,6 +2701,10 @@ mod tests {
         // 支持数 2 件 (log10 ≒ 0.3) は、文の尤度が十分に上がるときだけ採る
         assert!(!pattern_accepted(g, 1.0, 0.3));
         assert!(pattern_accepted(g, 3.0, 0.3));
+        // 一般文の下限は 3.0 (改善幅 1.9 + 4 × 0.3 = 3.1 は採り、法令文では捨てる)
+        assert!(pattern_accepted(g, 1.9, 0.3));
+        assert!(!pattern_accepted(g, 1.7, 0.3));
+        assert!(!pattern_accepted(Domain::Legal, 1.9, 0.3));
         // 「いたしまします → いたしまいます」(文の Δ が大きく負) はどの文書でも捨てる
         assert!(!pattern_accepted(g, -12.0, 0.78));
         assert!(!pattern_accepted(Domain::Legal, -12.0, 0.78));
